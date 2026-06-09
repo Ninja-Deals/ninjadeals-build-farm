@@ -54,10 +54,11 @@ jobs:
 
       - name: Build for ARM64
         run: |
-          if [ "${{ matrix.service }}" = "frontend" ]; then
-            cd frontend
-          else
-            cd services/${{ matrix.service }}
-          fi
           echo "Building ${{ matrix.service }} for linux/arm64 target architecture..."
-          docker buildx build --platform linux/arm64 -t ninjadeals-${{ matrix.service }}:arm64 .
+          if [ "${{ matrix.service }}" = "frontend" ]; then
+            docker buildx build --platform linux/arm64 -f frontend/Dockerfile -t ninjadeals-frontend:arm64 frontend/
+          elif [ "${{ matrix.service }}" = "ranking" ]; then
+            docker buildx build --platform linux/arm64 -f services/ranking/Dockerfile -t ninjadeals-ranking:arm64 services/ranking/
+          else
+            docker buildx build --platform linux/arm64 -f services/${{ matrix.service }}/Dockerfile -t ninjadeals-${{ matrix.service }}:arm64 .
+          fi
