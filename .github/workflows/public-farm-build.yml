@@ -129,7 +129,7 @@ jobs:
           chmod 600 d_key
           
           # Prepare Tunnel
-          FINAL_SSH_CMD=$(echo "$SSH_CMD" | sed "s|<privateKey>|b_key|g" | sed "s|<localPort>|2222|g")
+          FINAL_SSH_CMD=$(echo "$SSH_CMD" | sed "s|<privateKey>|b_key|g" | sed "s|<localPort>|2222|g" | sed "s|^ssh |ssh -o StrictHostKeyChecking=no |")
           
           echo "Opening tunnel..."
           $FINAL_SSH_CMD &
