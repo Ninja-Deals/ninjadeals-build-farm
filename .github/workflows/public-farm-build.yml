@@ -104,7 +104,7 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_PAT }}
 
       - name: Set up OCI CLI
-        uses: oracle-actions/setup-oci-cli-action@v1.3.2
+        uses: oracle-actions/setup-oci-cli@v1.3.2
         with:
           user: ${{ secrets.OCI_USER_OCID }}
           tenancy: ${{ secrets.OCI_TENANCY_OCID }}
