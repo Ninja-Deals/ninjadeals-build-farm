@@ -1,5 +1,7 @@
 name: Public Farm Build (ARM64)
 on:
+  push:
+    branches: [main]
   workflow_dispatch: null
   repository_dispatch:
     types:
