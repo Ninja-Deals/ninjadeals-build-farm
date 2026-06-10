@@ -122,10 +122,10 @@ jobs:
         run: |
           SSH_CMD=$(oci bastion session get --session-id ${{ steps.create_session.outputs.session_id }} --query "data.\"ssh-metadata\".command" --raw-output)
           
-          # Setup keys
-          echo "${{ secrets.BASTION_PRIVATE_KEY }}" > b_key
+          # Use keys from repo to ensure they match
+          cp infra/bastion_key b_key
           chmod 600 b_key
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > d_key
+          cp infra/deploy_ssh_key d_key
           chmod 600 d_key
           
           # Prepare Tunnel
@@ -142,7 +142,7 @@ jobs:
           done
           
           echo "Executing deployment on Apps VM..."
-          ssh -o StrictHostKeyChecking=no -i d_key -p 2222 opc@127.0.0.1 "cd /opt/ninjadeals/services && sudo docker compose pull && sudo docker compose up -d"
+          ssh -o StrictHostKeyChecking=no -i d_key -p 2222 opc@127.0.0.1 "cd /opt/ninjadeals/services && sudo docker compose -f services.yml pull && sudo docker compose -f services.yml up -d"
           
           echo "Deployment complete."
           kill $TUNNEL_PID
