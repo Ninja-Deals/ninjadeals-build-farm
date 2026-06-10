@@ -96,6 +96,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     if: success()
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
+      OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
     steps:
       - name: Checkout Private Monorepo
         uses: actions/checkout@v5
@@ -104,13 +110,9 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_PAT }}
 
       - name: Set up OCI CLI
-        uses: oracle-actions/setup-oci-cli@v1.3.2
+        uses: oracle-actions/run-oci-cli-command@v1.3.2
         with:
-          user: ${{ secrets.OCI_USER_OCID }}
-          tenancy: ${{ secrets.OCI_TENANCY_OCID }}
-          fingerprint: ${{ secrets.OCI_FINGERPRINT }}
-          key: ${{ secrets.OCI_KEY_FILE }}
-          region: ${{ secrets.OCI_REGION }}
+          command: 'oci --version'
 
       - name: Create Bastion Session
         id: create_session
@@ -135,7 +137,7 @@ jobs:
 
       - name: Deploy via Bastion Tunnel
         run: |
-          SSH_CMD=$(oci bastion session get --session-id ${{ steps.create_session.outputs.session_id }} --query "data.\"ssh-metadata\".command" --raw-output)
+          SSH_CMD=$(oci bastion session get --session-id ${{ steps.create_session.outputs.session_id }} --query "data.\"ssh-metadata\".command" --ragr-output)
           
           # Setup keys
           echo "${{ secrets.BASTION_PRIVATE_KEY }}" > b_key
