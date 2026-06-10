@@ -1,97 +1,54 @@
 name: Public Farm Build (ARM64)
-
 on:
-  workflow_dispatch:
+  workflow_dispatch: null
   repository_dispatch:
-    types: [trigger-build]
-
+    types:
+    - trigger-build
 env:
   REGISTRY: ghcr.io
-
 jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service: 
-          - bff
-          - comment
-          - deal
-          - discovery
-          - following
-          - forum
-          - frontend
-          - hello
-          - identity
-          - inbox
-          - indexing-projection
-          - media
-          - moderation
-          - notification
-          - offer
-          - price-collector
-          - price-history
-          - pricing
-          - ranking
-          - reputation
-          - rewards
-          - saved-items
-          - search
-          - user-profile
-          - vote
-          - wallet
-
+        service:
+        - hello
     permissions:
       contents: read
       packages: write
-
     steps:
-      - name: Checkout Private Monorepo
-        uses: actions/checkout@v5
-        with:
-          repository: 'Ninja-Deals/ninjadeals-main'
-          token: ${{ secrets.PRIVATE_REPO_PAT }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-        with:
-          cache-image: false
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.PRIVATE_REPO_PAT }}
-
-      - name: Build and Push for ARM64
-        run: |
-          echo "Building ${{ matrix.service }} for linux/arm64 target architecture..."
-          IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:latest"
-          if [ "${{ matrix.service }}" = "frontend" ]; then
-            docker buildx build --platform linux/arm64 \
-              --cache-from=type=gha,scope=frontend \
-              --cache-to=type=gha,mode=max,scope=frontend \
-              --push \
-              -f frontend/Dockerfile -t $IMAGE frontend/
-          elif [ "${{ matrix.service }}" = "ranking" ]; then
-            docker buildx build --platform linux/arm64 \
-              --cache-from=type=gha,scope=ranking \
-              --cache-to=type=gha,mode=max,scope=ranking \
-              --push \
-              -f services/ranking/Dockerfile -t $IMAGE services/ranking/
-          else
-            docker buildx build --platform linux/arm64 \
-              --cache-from=type=gha,scope=${{ matrix.service }} \
-              --cache-to=type=gha,mode=max,scope=${{ matrix.service }} \
-              --push \
-              -f services/${{ matrix.service }}/Dockerfile -t $IMAGE .
-          fi
-
+    - name: Checkout Private Monorepo
+      uses: actions/checkout@v5
+      with:
+        repository: Ninja-Deals/ninjadeals-main
+        token: ${{ secrets.PRIVATE_REPO_PAT }}
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v4
+      with:
+        cache-image: false
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+    - name: Login to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.PRIVATE_REPO_PAT }}
+    - name: Build and Push for ARM64
+      run: "echo \"Building ${{ matrix.service }} for linux/arm64 target architecture...\"\
+        \nIMAGE=\"ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:latest\"\
+        \nif [ \"${{ matrix.service }}\" = \"frontend\" ]; then\n  docker buildx build\
+        \ --platform linux/arm64 \\\n    --cache-from=type=gha,scope=frontend \\\n\
+        \    --cache-to=type=gha,mode=max,scope=frontend \\\n    --push \\\n    -f\
+        \ frontend/Dockerfile -t $IMAGE frontend/\nelif [ \"${{ matrix.service }}\"\
+        \ = \"ranking\" ]; then\n  docker buildx build --platform linux/arm64 \\\n\
+        \    --cache-from=type=gha,scope=ranking \\\n    --cache-to=type=gha,mode=max,scope=ranking\
+        \ \\\n    --push \\\n    -f services/ranking/Dockerfile -t $IMAGE services/ranking/\n\
+        else\n  docker buildx build --platform linux/arm64 \\\n    --cache-from=type=gha,scope=${{\
+        \ matrix.service }} \\\n    --cache-to=type=gha,mode=max,scope=${{ matrix.service\
+        \ }} \\\n    --push \\\n    -f services/${{ matrix.service }}/Dockerfile -t\
+        \ $IMAGE .\nfi\n"
   deploy:
     runs-on: ubuntu-latest
     needs: build
@@ -103,68 +60,41 @@ jobs:
       OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
       OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
     steps:
-      - name: Checkout Private Monorepo
-        uses: actions/checkout@v5
-        with:
-          repository: 'Ninja-Deals/ninjadeals-main'
-          token: ${{ secrets.PRIVATE_REPO_PAT }}
+    - name: Checkout Private Monorepo
+      uses: actions/checkout@v5
+      with:
+        repository: Ninja-Deals/ninjadeals-main
+        token: ${{ secrets.PRIVATE_REPO_PAT }}
+    - name: Set up OCI CLI
+      uses: oracle-actions/run-oci-cli-command@v1.3.2
+      with:
+        command: oci --version
+    - name: Create Bastion Session
+      id: create_session
+      run: "SESSION_ID=$(oci bastion session create-port-forwarding \\\n  --bastion-id\
+        \ ${{ secrets.BASTION_ID }} \\\n  --display-name \"deploy-$(date +%s)\" \\\
+        \n  --ssh-public-key-file infra/bastion_key.pub \\\n  --target-private-ip\
+        \ 10.0.30.20 \\\n  --target-port 22 \\\n  --session-ttl 1800 \\\n  --query\
+        \ \"data.id\" --raw-output)\necho \"session_id=$SESSION_ID\" >> $GITHUB_OUTPUT\n"
+    - name: Wait for Session ACTIVE
+      run: "while true; do\n  STATE=$(oci bastion session get --session-id ${{ steps.create_session.outputs.session_id\
+        \ }} --query \"data.\\\"lifecycle-state\\\"\" --raw-output)\n  if [ \"$STATE\"\
+        \ == \"ACTIVE\" ]; then break; fi\n  sleep 5\ndone\n"
+    - name: Deploy via Bastion Tunnel
+      run: "SSH_CMD=$(oci bastion session get --session-id ${{ steps.create_session.outputs.session_id\
+        \ }} --query \"data.\\\"ssh-metadata\\\".command\" --ragr-output)\n\n# Setup\
+        \ keys\necho \"${{ secrets.BASTION_PRIVATE_KEY }}\" > b_key\nchmod 600 b_key\n\
+        echo \"${{ secrets.SSH_PRIVATE_KEY }}\" > d_key\nchmod 600 d_key\n\n# Prepare\
+        \ Tunnel\nFINAL_SSH_CMD=$(echo \"$SSH_CMD\" | sed \"s|<privateKey>|b_key|g\"\
+        \ | sed \"s|<localPort>|2222|g\")\n\necho \"Opening tunnel...\"\n$FINAL_SSH_CMD\
+        \ &\nTUNNEL_PID=$!\n\n# Wait for tunnel to be ready\nfor i in {1..20}; do\n\
+        \  nc -z localhost 2222 && break\n  sleep 2\ndone\n\necho \"Executing deployment\
+        \ on Apps VM...\"\nssh -o StrictHostKeyChecking=no -i d_key -p 2222 opc@127.0.0.1\
+        \ \"cd /opt/ninjadeals/services && sudo docker compose pull && sudo docker\
+        \ compose up -d\"\n\necho \"Deployment complete.\"\nkill $TUNNEL_PID\n"
+    - name: Cleanup Session
+      if: always()
+      run: 'oci bastion session delete --session-id ${{ steps.create_session.outputs.session_id
+        }} --force
 
-      - name: Set up OCI CLI
-        uses: oracle-actions/run-oci-cli-command@v1.3.2
-        with:
-          command: 'oci --version'
-
-      - name: Create Bastion Session
-        id: create_session
-        run: |
-          SESSION_ID=$(oci bastion session create-port-forwarding \
-            --bastion-id ${{ secrets.BASTION_ID }} \
-            --display-name "deploy-$(date +%s)" \
-            --ssh-public-key-file infra/bastion_key.pub \
-            --target-private-ip 10.0.30.20 \
-            --target-port 22 \
-            --session-ttl 1800 \
-            --query "data.id" --raw-output)
-          echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
-
-      - name: Wait for Session ACTIVE
-        run: |
-          while true; do
-            STATE=$(oci bastion session get --session-id ${{ steps.create_session.outputs.session_id }} --query "data.\"lifecycle-state\"" --raw-output)
-            if [ "$STATE" == "ACTIVE" ]; then break; fi
-            sleep 5
-          done
-
-      - name: Deploy via Bastion Tunnel
-        run: |
-          SSH_CMD=$(oci bastion session get --session-id ${{ steps.create_session.outputs.session_id }} --query "data.\"ssh-metadata\".command" --ragr-output)
-          
-          # Setup keys
-          echo "${{ secrets.BASTION_PRIVATE_KEY }}" > b_key
-          chmod 600 b_key
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > d_key
-          chmod 600 d_key
-          
-          # Prepare Tunnel
-          FINAL_SSH_CMD=$(echo "$SSH_CMD" | sed "s|<privateKey>|b_key|g" | sed "s|<localPort>|2222|g")
-          
-          echo "Opening tunnel..."
-          $FINAL_SSH_CMD &
-          TUNNEL_PID=$!
-          
-          # Wait for tunnel to be ready
-          for i in {1..20}; do
-            nc -z localhost 2222 && break
-            sleep 2
-          done
-          
-          echo "Executing deployment on Apps VM..."
-          ssh -o StrictHostKeyChecking=no -i d_key -p 2222 opc@127.0.0.1 "cd /opt/ninjadeals/services && sudo docker compose pull && sudo docker compose up -d"
-          
-          echo "Deployment complete."
-          kill $TUNNEL_PID
-
-      - name: Cleanup Session
-        if: always()
-        run: |
-          oci bastion session delete --session-id ${{ steps.create_session.outputs.session_id }} --force
+        '
