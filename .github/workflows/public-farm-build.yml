@@ -12,38 +12,35 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          # Default full list of services
+          FULL_LIST='["bff","comment","deal","discovery","following","forum","frontend","hello","identity","inbox","indexing-projection","media","moderation","notification","offer","price-collector","price-history","pricing","ranking","reputation","rewards","saved-items","search","user-profile","vote","wallet"]'
+          
+          # Check if the trigger provided a specific list of services
+          SERVICES='${{ github.event.client_payload.services }}'
+          
+          if [ -z "$SERVICES" ] || [ "$SERVICES" == "null" ]; then
+            echo "No services list provided in payload. Using full build list."
+            RESULT=$FULL_LIST
+          else
+            echo "Triggered for services: $SERVICES"
+            RESULT=$SERVICES
+          fi
+          
+          echo "matrix={\"service\":$RESULT}" >> $GITHUB_OUTPUT
+
   build:
+    needs: setup-matrix
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        service: 
-          - bff
-          - comment
-          - deal
-          - discovery
-          - following
-          - forum
-          - frontend
-          - hello
-          - identity
-          - inbox
-          - indexing-projection
-          - media
-          - moderation
-          - notification
-          - offer
-          - price-collector
-          - price-history
-          - pricing
-          - ranking
-          - reputation
-          - rewards
-          - saved-items
-          - search
-          - user-profile
-          - vote
-          - wallet
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     permissions:
       contents: read
@@ -106,7 +103,7 @@ jobs:
 
   deploy:
     runs-on: ubuntu-latest
-    needs: build
+    needs: [setup-matrix, build]
     if: success()
     env:
       OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
@@ -163,9 +160,6 @@ jobs:
           chmod 600 d_key
           
           # Prepare Tunnel Command with robust options
-          # 1. Replace placeholder with b_key
-          # 2. Set local port to 2222
-          # 3. Add safety options to the ssh command
           FINAL_SSH_CMD=$(echo "$SSH_CMD" | sed "s|<privateKey>|b_key|g" | sed "s|<localPort>|2222|g" | sed "s|ssh |ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes |")
           
           echo "Opening tunnel..."
@@ -186,8 +180,12 @@ jobs:
             sleep 2
           done
           
+          # Construct the Docker Compose Up command for specific services
+          SERVICES_LIST=$(echo '${{ needs.setup-matrix.outputs.matrix }}' | jq -r '.service | join(" ")')
+          echo "Target services for deployment: $SERVICES_LIST"
+          
           echo "Executing deployment on Apps VM..."
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 "cd /opt/ninjadeals/services && sudo docker compose -f services.yml pull && sudo docker compose -f services.yml up -d"
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 "cd /opt/ninjadeals/services && sudo docker compose -f services.yml pull $SERVICES_LIST && sudo docker compose -f services.yml up -d $SERVICES_LIST"
           
           echo "Deployment complete."
           kill $TUNNEL_PID
