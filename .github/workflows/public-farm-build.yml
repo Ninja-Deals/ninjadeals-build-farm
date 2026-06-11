@@ -9,6 +9,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -63,6 +64,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Login to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -75,11 +85,23 @@ jobs:
           echo "Building ${{ matrix.service }} for linux/arm64 target architecture..."
           IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:latest"
           if [ "${{ matrix.service }}" = "frontend" ]; then
-            docker buildx build --platform linux/arm64               --cache-from=type=gha,scope=frontend               --cache-to=type=gha,mode=max,scope=frontend               --push               -f frontend/Dockerfile -t $IMAGE frontend/
+            docker buildx build --platform linux/arm64 \
+              --cache-from=type=gha,scope=frontend \
+              --cache-to=type=gha,mode=max,scope=frontend \
+              --push \
+              -f frontend/Dockerfile -t $IMAGE frontend/
           elif [ "${{ matrix.service }}" = "ranking" ]; then
-            docker buildx build --platform linux/arm64               --cache-from=type=gha,scope=ranking               --cache-to=type=gha,mode=max,scope=ranking               --push               -f services/ranking/Dockerfile -t $IMAGE services/ranking/
+            docker buildx build --platform linux/arm64 \
+              --cache-from=type=gha,scope=ranking \
+              --cache-to=type=gha,mode=max,scope=ranking \
+              --push \
+              -f services/ranking/Dockerfile -t $IMAGE services/ranking/
           else
-            docker buildx build --platform linux/arm64               --cache-from=type=gha,scope=${{ matrix.service }}               --cache-to=type=gha,mode=max,scope=${{ matrix.service }}               --push               -f services/${{ matrix.service }}/Dockerfile -t $IMAGE .
+            docker buildx build --platform linux/arm64 \
+              --cache-from=type=gha,scope=${{ matrix.service }} \
+              --cache-to=type=gha,mode=max,scope=${{ matrix.service }} \
+              --push \
+              -f services/${{ matrix.service }}/Dockerfile -t $IMAGE .
           fi
 
   deploy:
@@ -92,6 +114,7 @@ jobs:
       OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
       OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
       OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout Private Monorepo
         uses: actions/checkout@v5
@@ -107,7 +130,14 @@ jobs:
       - name: Create Bastion Session
         id: create_session
         run: |
-          SESSION_ID=$(oci bastion session create-port-forwarding             --bastion-id ${{ secrets.BASTION_ID }}             --display-name "deploy-$(date +%s)"             --ssh-public-key-file infra/bastion_key.pub             --target-private-ip 10.0.30.20             --target-port 22             --session-ttl 1800             --query "data.id" --raw-output)
+          SESSION_ID=$(oci bastion session create-port-forwarding \
+            --bastion-id ${{ secrets.BASTION_ID }} \
+            --display-name "deploy-$(date +%s)" \
+            --ssh-public-key-file infra/bastion_key.pub \
+            --target-private-ip 10.0.30.20 \
+            --target-port 22 \
+            --session-ttl 1800 \
+            --query "data.id" --raw-output)
           echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
 
       - name: Wait for Session ACTIVE
