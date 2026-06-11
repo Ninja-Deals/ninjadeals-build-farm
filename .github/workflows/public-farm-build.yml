@@ -153,10 +153,20 @@ jobs:
         run: |
           SSH_CMD=$(oci bastion session get --session-id ${{ steps.create_session.outputs.session_id }} --query "data.\"ssh-metadata\".command" --raw-output)
           
-          # Prepare keys
-          cp infra/bastion_key b_key
+          # Setup keys - Use secrets as they are the known good configuration
+          # Fallback to repo files if secrets are not available
+          if [ -n "${{ secrets.BASTION_PRIVATE_KEY }}" ]; then
+            echo "${{ secrets.BASTION_PRIVATE_KEY }}" > b_key
+          else
+            cp infra/bastion_key b_key
+          fi
           chmod 600 b_key
-          cp infra/deploy_ssh_key d_key
+
+          if [ -n "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "${{ secrets.SSH_PRIVATE_KEY }}" > d_key
+          else
+            cp infra/deploy_ssh_key d_key
+          fi
           chmod 600 d_key
           
           # Prepare Tunnel Command with robust options
