@@ -48,7 +48,7 @@ jobs:
 
     steps:
       - name: Checkout Private Monorepo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.1.0
         with:
           repository: 'Ninja-Deals/ninjadeals-main'
           token: ${{ secrets.PRIVATE_REPO_PAT }}
@@ -113,7 +113,7 @@ jobs:
       OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
     steps:
       - name: Checkout Private Monorepo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.1.0
         with:
           repository: 'Ninja-Deals/ninjadeals-main'
           token: ${{ secrets.PRIVATE_REPO_PAT }}
