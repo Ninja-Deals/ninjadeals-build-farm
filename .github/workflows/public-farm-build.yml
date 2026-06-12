@@ -21,15 +21,16 @@ jobs:
           # Default full list of services
           FULL_LIST='["bff","comment","deal","discovery","following","forum","frontend","hello","identity","inbox","indexing-projection","media","moderation","notification","offer","price-collector","price-history","pricing","ranking","reputation","rewards","saved-items","search","user-profile","vote","wallet"]'
 
-          # toJson() correctly serialises the JSON array from repository_dispatch payload
-          SERVICES='${{ toJson(github.event.client_payload.services) }}'
+          # toJson() returns pretty-printed JSON; jq -c compacts it to a single line
+          # so the matrix value fits in GITHUB_OUTPUT's key=value format
+          SERVICES_RAW='${{ toJson(github.event.client_payload.services) }}'
 
-          if [ -z "$SERVICES" ] || [ "$SERVICES" == "null" ]; then
-            echo "No services list provided in payload. Using full build list."
+          if [ -z "$SERVICES_RAW" ] || [ "$SERVICES_RAW" == "null" ]; then
+            echo "No services list provided. Using full build list."
             RESULT=$FULL_LIST
           else
-            echo "Triggered for services: $SERVICES"
-            RESULT=$SERVICES
+            RESULT=$(echo "$SERVICES_RAW" | jq -c '.')
+            echo "Triggered for services: $RESULT"
           fi
 
           echo "matrix={\"service\":$RESULT}" >> $GITHUB_OUTPUT
