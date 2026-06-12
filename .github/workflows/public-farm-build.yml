@@ -126,9 +126,7 @@ jobs:
         id: create_session
         run: |
           # Clean public key to avoid trailing whitespace issues
-          cat infra/bastion_key.pub | tr -d '
-' > b_key.pub
-          SESSION_ID=$(oci bastion session create-port-forwarding \
+          tr -d '\n\r' < infra/bastion_key.pub > b_key.pub
             --bastion-id ${{ secrets.BASTION_ID }} \
             --display-name "deploy-$(date +%s)" \
             --ssh-public-key-file b_key.pub \
