@@ -20,10 +20,10 @@ jobs:
         run: |
           # Default full list of services
           FULL_LIST='["bff","comment","deal","discovery","following","forum","frontend","hello","identity","inbox","indexing-projection","media","moderation","notification","offer","price-collector","price-history","pricing","ranking","reputation","rewards","saved-items","search","user-profile","vote","wallet"]'
-          
-          # Check if the trigger provided a specific list of services
-          SERVICES='${{ github.event.client_payload.services }}'
-          
+
+          # toJson() correctly serialises the JSON array from repository_dispatch payload
+          SERVICES='${{ toJson(github.event.client_payload.services) }}'
+
           if [ -z "$SERVICES" ] || [ "$SERVICES" == "null" ]; then
             echo "No services list provided in payload. Using full build list."
             RESULT=$FULL_LIST
@@ -31,7 +31,7 @@ jobs:
             echo "Triggered for services: $SERVICES"
             RESULT=$SERVICES
           fi
-          
+
           echo "matrix={\"service\":$RESULT}" >> $GITHUB_OUTPUT
 
   build:
@@ -47,7 +47,7 @@ jobs:
 
     steps:
       - name: Checkout Private Monorepo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: 'Ninja-Deals/ninjadeals-main'
           token: ${{ secrets.PRIVATE_REPO_PAT }}
@@ -110,10 +110,9 @@ jobs:
       OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
       OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
       OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout Private Monorepo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: 'Ninja-Deals/ninjadeals-main'
           token: ${{ secrets.PRIVATE_REPO_PAT }}
@@ -127,7 +126,8 @@ jobs:
         id: create_session
         run: |
           # Clean public key to avoid trailing whitespace issues
-          cat infra/bastion_key.pub | tr -d '\n\r' > b_key.pub
+          cat infra/bastion_key.pub | tr -d '
+' > b_key.pub
           SESSION_ID=$(oci bastion session create-port-forwarding \
             --bastion-id ${{ secrets.BASTION_ID }} \
             --display-name "deploy-$(date +%s)" \
@@ -151,9 +151,8 @@ jobs:
       - name: Deploy via Bastion Tunnel
         run: |
           SSH_CMD=$(oci bastion session get --session-id ${{ steps.create_session.outputs.session_id }} --query "data.\"ssh-metadata\".command" --raw-output)
-          
-          # Setup keys - Use secrets as they are the known good configuration
-          # Fallback to repo files if secrets are not available
+
+          # Use secrets as source of truth for SSH keys
           if [ -n "${{ secrets.BASTION_PRIVATE_KEY }}" ]; then
             echo "${{ secrets.BASTION_PRIVATE_KEY }}" > b_key
           else
@@ -167,15 +166,13 @@ jobs:
             cp infra/deploy_ssh_key d_key
           fi
           chmod 600 d_key
-          
-          # Prepare Tunnel Command with robust options
+
           FINAL_SSH_CMD=$(echo "$SSH_CMD" | sed "s|<privateKey>|b_key|g" | sed "s|<localPort>|2222|g" | sed "s|ssh |ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes |")
-          
+
           echo "Opening tunnel..."
           $FINAL_SSH_CMD &
           TUNNEL_PID=$!
-          
-          # Wait for tunnel to be ready
+
           echo "Waiting for tunnel on localhost:2222..."
           for i in {1..30}; do
             if nc -z localhost 2222; then
@@ -188,14 +185,14 @@ jobs:
             fi
             sleep 2
           done
-          
-          # Construct the Docker Compose Up command for specific services
+
           SERVICES_LIST=$(echo '${{ needs.setup-matrix.outputs.matrix }}' | jq -r '.service | join(" ")')
           echo "Target services for deployment: $SERVICES_LIST"
-          
+
           echo "Executing deployment on Apps VM..."
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 "cd /opt/ninjadeals/services && sudo docker compose -f services.yml pull $SERVICES_LIST && sudo docker compose -f services.yml up -d $SERVICES_LIST"
-          
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
+            "cd /opt/ninjadeals/services && sudo docker compose -f services.yml pull $SERVICES_LIST && sudo docker compose -f services.yml up -d $SERVICES_LIST"
+
           echo "Deployment complete."
           kill $TUNNEL_PID
 
