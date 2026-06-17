@@ -240,6 +240,25 @@ jobs:
           echo "ERROR: Tunnel failed to establish"
           exit 1
 
+      - name: Preflight — verify apps host is bootstrapped
+        run: |
+          # The deploy assumes cloud-init seeded /opt/ninjadeals/services/{services.yml,.env}
+          # on first boot. If cloud-init failed (or the VM was recreated and never
+          # re-provisioned), those files are missing and the deploy below dies with a
+          # cryptic "cd: No such file or directory". Fail fast with a fix instead.
+          if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+               -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
+               "test -f /opt/ninjadeals/services/services.yml && test -f /opt/ninjadeals/services/.env"; then
+            echo "Apps host bootstrapped: /opt/ninjadeals/services/{services.yml,.env} present."
+          else
+            echo "::error title=Apps host not bootstrapped::/opt/ninjadeals/services/{services.yml,.env} missing on 10.0.30.20"
+            echo "::error::The apps VM cloud-init did not seed the compose dir (likely failed on first boot, or the VM was recreated)."
+            echo "::error::Bootstrap it once, then re-run this deploy. Either:"
+            echo "::error::  (a) re-provision so the fixed cloud-init runs fresh:  cd infra && tofu taint oci_core_instance.apps && tofu apply"
+            echo "::error::  (b) seed the running host by hand: create /opt/ninjadeals/services, copy infra/compose/services.yml there, and write .env via /usr/local/bin/fetch_secret.sh (see scripts/deploy/deploy.sh in the monorepo)."
+            exit 1
+          fi
+
       - name: Deploy All Services
         run: |
           echo "Deploying: $SERVICES"
