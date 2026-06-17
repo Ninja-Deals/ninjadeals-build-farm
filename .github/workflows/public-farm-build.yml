@@ -1,15 +1,48 @@
 name: Public Farm Build (ARM64)
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  DEPLOYMENT METHODS
+#
+#  oci-run-command  (default for workflow_dispatch)
+#    OCI Cloud Agent runs docker compose directly on the VM — no SSH, no bastion,
+#    no quota issues. Requires:
+#      1. OCI dynamic group "ninjadeals-staging-compute-instances" matching rule
+#         set to: ALL {instance.compartment.id = '<compartment-ocid>'}
+#         → run: cd infra && terraform apply -target=oci_identity_dynamic_group.compute_instances
+#      2. IAM policy "ninjadeals-staging-run-command" (already created):
+#         Allow dynamic-group ... to use instance-agent-command-execution-family in tenancy
+#      3. "Compute Instance Run Command" plugin on the apps VM → already RUNNING
+#
+#  bastion  (default for push / repository_dispatch, always available)
+#    SSH tunnel through OCI Bastion → docker compose pull + up on the VM.
+# ─────────────────────────────────────────────────────────────────────────────
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to build+deploy (comma-separated). Leave empty for all 26.'
+        required: false
+        default: ''
+      deploy_method:
+        description: 'Deployment method'
+        required: false
+        default: 'oci-run-command'
+        type: choice
+        options:
+          - oci-run-command
+          - bastion
   repository_dispatch:
     types: [trigger-build]
 
 env:
   REGISTRY: ghcr.io
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  # OCI apps VM — used by oci-run-command method (no bastion needed)
+  OCI_APPS_INSTANCE_ID: 'ocid1.instance.oc1.ap-hyderabad-1.anuhsljrrhzgbsactjpue6s7vt5w5yks5mvgjj6wn4duzkw5cvzgyo2vrgsa'
+  OCI_COMPARTMENT_ID: 'ocid1.compartment.oc1..aaaaaaaazwsvuxdope6mv7pxdl5sldvkmsfh6qfecica5y5a245c6urcmwca'
 
 # Only one deploy run at a time. A new push cancels the in-progress run;
 # teardown (if: always) still fires on the cancelled run to clean up the session.
@@ -18,13 +51,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Creates the service matrix AND one shared bastion session upfront.
-  # All build-and-deploy jobs look up the active session directly from OCI
-  # — no job output propagation needed.
+  # ── SETUP ─────────────────────────────────────────────────────────────────
+  # Determines the service matrix.
+  # When deploy_method=bastion (or push/repository_dispatch), also creates the
+  # shared bastion session that all build-and-deploy jobs will reuse.
   setup:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      deploy_method: ${{ steps.resolve-method.outputs.deploy_method }}
     env:
       OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
       OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
@@ -38,18 +73,42 @@ jobs:
           repository: 'Ninja-Deals/ninjadeals-main'
           token: ${{ secrets.PRIVATE_REPO_PAT }}
 
-      - id: set-matrix
+      - name: Resolve deploy method
+        id: resolve-method
+        run: |
+          # workflow_dispatch: use the input value
+          # push / repository_dispatch: default to bastion (always reliable)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            METHOD="${{ inputs.deploy_method }}"
+          else
+            METHOD="bastion"
+          fi
+          echo "deploy_method=$METHOD" >> $GITHUB_OUTPUT
+          echo "Using deploy method: $METHOD"
+
+      - name: Build service matrix
+        id: set-matrix
         run: |
           FULL_LIST='["bff","comment","deal","discovery","following","forum","frontend","hello","identity","inbox","indexing-projection","media","moderation","notification","offer","price-collector","price-history","pricing","ranking","reputation","rewards","saved-items","search","user-profile","vote","wallet"]'
 
-          SERVICES_RAW='${{ toJson(github.event.client_payload.services) }}'
+          # Priority: workflow_dispatch input > repository_dispatch payload > all services
+          SERVICES_INPUT="${{ inputs.services }}"
+          SERVICES_PAYLOAD='${{ toJson(github.event.client_payload.services) }}'
 
-          if [ -z "$SERVICES_RAW" ] || [ "$SERVICES_RAW" == "null" ]; then
-            echo "No services list provided. Using full build list."
-            RESULT=$FULL_LIST
+          if [ -n "$SERVICES_INPUT" ]; then
+            RESULT=$(echo "$SERVICES_INPUT" | python3 -c "
+          import sys, json
+          raw = sys.stdin.read().strip()
+          services = [s.strip() for s in raw.split(',') if s.strip()]
+          print(json.dumps(services))
+          ")
+            echo "Manual trigger for: $RESULT"
+          elif [ -n "$SERVICES_PAYLOAD" ] && [ "$SERVICES_PAYLOAD" != "null" ] && [ "$SERVICES_PAYLOAD" != '""' ]; then
+            RESULT=$(echo "$SERVICES_PAYLOAD" | jq -c '.')
+            echo "Repository dispatch for: $RESULT"
           else
-            RESULT=$(echo "$SERVICES_RAW" | jq -c '.')
-            echo "Triggered for services: $RESULT"
+            RESULT=$FULL_LIST
+            echo "Full build: all 26 services"
           fi
 
           echo "matrix={\"service\":$RESULT}" >> $GITHUB_OUTPUT
@@ -59,9 +118,10 @@ jobs:
         with:
           command: 'oci --version'
 
+      # Only create a bastion session when the bastion deploy method is used
       - name: Create Shared Bastion Session
+        if: steps.resolve-method.outputs.deploy_method == 'bastion'
         run: |
-          # Purge stale sessions first so quota is never exceeded
           echo "Cleaning up stale bastion sessions..."
           STALE=$(oci bastion session list \
             --bastion-id ${{ secrets.BASTION_ID }} \
@@ -90,10 +150,9 @@ jobs:
           fi
           echo "Created session: $SESSION_ID"
 
-      - name: Wait for Session ACTIVE
+      - name: Wait for Bastion Session ACTIVE
+        if: steps.resolve-method.outputs.deploy_method == 'bastion'
         run: |
-          # Each deploy job will look up this session by querying ACTIVE sessions —
-          # no need to pass the session_id through job outputs.
           for i in {1..30}; do
             SESSION_ID=$(oci bastion session list \
               --bastion-id ${{ secrets.BASTION_ID }} \
@@ -103,7 +162,7 @@ jobs:
               echo "Session ACTIVE: $SESSION_ID"
               break
             fi
-            echo "Waiting for session to become active... ($i/30)"
+            echo "Waiting... ($i/30)"
             sleep 10
           done
           if [ -z "$SESSION_ID" ] || [ "$SESSION_ID" = "null" ]; then
@@ -111,14 +170,15 @@ jobs:
             exit 1
           fi
 
-  # Each service builds its image then immediately deploys via the shared
-  # bastion session — all 26 run in parallel, each with its own SSH tunnel.
+  # ── BUILD & DEPLOY ────────────────────────────────────────────────────────
+  # Each service: build ARM64 image → push to GHCR → deploy immediately.
+  # Deploy method is chosen per run (oci-run-command or bastion).
   build-and-deploy:
     needs: setup
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false    # one service failing does NOT cancel others
-      max-parallel: 10    # cap concurrent SSH tunnels to avoid OCI burst rate-limit
+      max-parallel: 10    # cap concurrency; also limits burst SSH for bastion method
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
 
     permissions:
@@ -131,6 +191,7 @@ jobs:
       OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
       OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
       OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
+      DEPLOY_METHOD: ${{ needs.setup.outputs.deploy_method }}
 
     steps:
       - name: Checkout Private Monorepo
@@ -163,8 +224,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.PRIVATE_REPO_PAT }}
 
-      # ── BUILD ────────────────────────────────────────────────────────────────
-      - name: Build and Push for ARM64
+      # ── BUILD ──────────────────────────────────────────────────────────────
+      - name: Build and Push ${{ matrix.service }} (ARM64)
         run: |
           echo "Building ${{ matrix.service }} for linux/arm64..."
           IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:latest"
@@ -172,31 +233,98 @@ jobs:
             docker buildx build --platform linux/arm64 \
               --cache-from=type=gha,scope=frontend \
               --cache-to=type=gha,mode=max,scope=frontend \
-              --push \
-              -f frontend/Dockerfile -t $IMAGE frontend/
+              --push -f frontend/Dockerfile -t $IMAGE frontend/
           elif [ "${{ matrix.service }}" = "ranking" ]; then
             docker buildx build --platform linux/arm64 \
               --cache-from=type=gha,scope=ranking \
               --cache-to=type=gha,mode=max,scope=ranking \
-              --push \
-              -f services/ranking/Dockerfile -t $IMAGE services/ranking/
+              --push -f services/ranking/Dockerfile -t $IMAGE services/ranking/
           else
             docker buildx build --platform linux/arm64 \
               --cache-from=type=gha,scope=${{ matrix.service }} \
               --cache-to=type=gha,mode=max,scope=${{ matrix.service }} \
-              --push \
-              -f services/${{ matrix.service }}/Dockerfile -t $IMAGE .
+              --push -f services/${{ matrix.service }}/Dockerfile -t $IMAGE .
           fi
 
-      # ── DEPLOY (immediately after this service's build, via shared session) ─
       - name: Set up OCI CLI
         uses: oracle-actions/run-oci-cli-command@v1.3.2
         with:
           command: 'oci --version'
 
-      - name: Deploy ${{ matrix.service }}
+      # ── DEPLOY: OCI Run Command (no bastion, no SSH) ───────────────────────
+      # OCI Cloud Agent on the VM receives the command via OCI's control plane.
+      # Prerequisite: dynamic group matching rule must be set (see header comment).
+      - name: Deploy ${{ matrix.service }} via OCI Run Command
+        if: env.DEPLOY_METHOD == 'oci-run-command'
         run: |
-          # Look up the active session created by the setup job — no job output needed
+          SERVICE="${{ matrix.service }}"
+          echo "Deploying $SERVICE via OCI Run Command..."
+
+          SCRIPT=$(printf '%s\n' \
+            "#!/bin/bash" \
+            "set -e" \
+            "sudo docker image prune -af --filter 'until=24h' 2>/dev/null || true" \
+            "cd /opt/ninjadeals/services" \
+            "sudo docker compose -f services.yml pull $SERVICE" \
+            "sudo docker compose -f services.yml up -d $SERVICE" \
+            "echo '✓ $SERVICE deployed'")
+
+          ENCODED=$(echo "$SCRIPT" | base64 -w 0)
+
+          cat > /tmp/cmd_target.json <<EOF
+          {"instanceId": "$OCI_APPS_INSTANCE_ID"}
+          EOF
+
+          cat > /tmp/cmd_content.json <<EOF
+          {
+            "source": {"sourceType": "TEXT", "text": "$ENCODED"},
+            "output": {"outputType": "TEXT"}
+          }
+          EOF
+
+          COMMAND_ID=$(oci instance-agent command create \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --target file:///tmp/cmd_target.json \
+            --content file:///tmp/cmd_content.json \
+            --timeout-in-seconds 300 \
+            --display-name "deploy-${SERVICE}-${{ github.run_id }}" \
+            --query "data.id" --raw-output 2>/tmp/oci_cmd_err || true)
+
+          if [ -z "$COMMAND_ID" ] || [ "$COMMAND_ID" = "null" ]; then
+            echo "ERROR: Failed to create OCI Run Command:"
+            cat /tmp/oci_cmd_err || true
+            exit 1
+          fi
+          echo "Command ID: $COMMAND_ID"
+
+          # Poll until SUCCEEDED / FAILED / TIMED_OUT (max 5 min)
+          for i in {1..30}; do
+            RESULT=$(oci instance-agent command-execution get \
+              --instance-id "$OCI_APPS_INSTANCE_ID" \
+              --command-id "$COMMAND_ID" 2>/dev/null || echo '{}')
+            STATE=$(echo "$RESULT" | jq -r '.data."lifecycle-state" // "UNKNOWN"')
+            echo "[$i/30] State: $STATE"
+            case "$STATE" in
+              SUCCEEDED)
+                echo "✓ $SERVICE deployed successfully"
+                OUTPUT=$(echo "$RESULT" | jq -r '.data.content.output.text // empty' 2>/dev/null)
+                [ -n "$OUTPUT" ] && echo "$OUTPUT" | base64 -d 2>/dev/null || true
+                break
+                ;;
+              FAILED|TIMED_OUT)
+                echo "ERROR: Command $STATE"
+                OUTPUT=$(echo "$RESULT" | jq -r '.data.content.output.text // empty' 2>/dev/null)
+                [ -n "$OUTPUT" ] && echo "$OUTPUT" | base64 -d 2>/dev/null || true
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+
+      # ── DEPLOY: Bastion SSH tunnel ─────────────────────────────────────────
+      - name: Deploy ${{ matrix.service }} via Bastion
+        if: env.DEPLOY_METHOD == 'bastion'
+        run: |
           SESSION_ID=$(oci bastion session list \
             --bastion-id ${{ secrets.BASTION_ID }} \
             --session-lifecycle-state ACTIVE \
@@ -230,7 +358,6 @@ jobs:
             | sed "s|<localPort>|2222|g" \
             | sed "s|ssh |ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes |")
 
-          # OCI Bastion rate-limits burst SSH connections — retry up to 5x with backoff
           TUNNEL_PID=""
           ESTABLISHED=false
           for attempt in 1 2 3 4 5; do
@@ -259,7 +386,6 @@ jobs:
             exit 1
           fi
 
-          echo "Pulling and restarting ${{ matrix.service }}..."
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
             "sudo docker image prune -af --filter 'until=24h' 2>/dev/null || true && \
@@ -270,10 +396,11 @@ jobs:
 
           kill $TUNNEL_PID || true
 
-  # Cleans up the shared bastion session after all jobs finish (or fail).
+  # ── TEARDOWN ──────────────────────────────────────────────────────────────
+  # Deletes the shared bastion session. Skipped entirely for oci-run-command.
   teardown:
     needs: [setup, build-and-deploy]
-    if: always()
+    if: always() && needs.setup.outputs.deploy_method == 'bastion'
     runs-on: ubuntu-latest
     env:
       OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
