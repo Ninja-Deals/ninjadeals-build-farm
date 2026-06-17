@@ -15,14 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      services_list: ${{ steps.set-matrix.outputs.services_list }}
     steps:
       - id: set-matrix
         run: |
-          # Default full list of services
           FULL_LIST='["bff","comment","deal","discovery","following","forum","frontend","hello","identity","inbox","indexing-projection","media","moderation","notification","offer","price-collector","price-history","pricing","ranking","reputation","rewards","saved-items","search","user-profile","vote","wallet"]'
 
-          # toJson() returns pretty-printed JSON; jq -c compacts it to a single line
-          # so the matrix value fits in GITHUB_OUTPUT's key=value format
           SERVICES_RAW='${{ toJson(github.event.client_payload.services) }}'
 
           if [ -z "$SERVICES_RAW" ] || [ "$SERVICES_RAW" == "null" ]; then
@@ -34,25 +32,19 @@ jobs:
           fi
 
           echo "matrix={\"service\":$RESULT}" >> $GITHUB_OUTPUT
+          # space-separated list for the deploy job
+          echo "services_list=$(echo $RESULT | jq -r 'join(" ")')" >> $GITHUB_OUTPUT
 
-  build-and-deploy:
+  build:
     needs: setup-matrix
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false       # one service failing does NOT cancel others
-      max-parallel: 10       # cap concurrent bastion sessions to avoid OCI rate limits
+      fail-fast: false       # one build failing does NOT cancel others
       matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     permissions:
       contents: read
       packages: write
-
-    env:
-      OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
-      OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
-      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
-      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
-      OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
 
     steps:
       - name: Checkout Private Monorepo
@@ -85,7 +77,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.PRIVATE_REPO_PAT }}
 
-      # ── BUILD ────────────────────────────────────────────────────────────────
       - name: Build and Push for ARM64
         run: |
           echo "Building ${{ matrix.service }} for linux/arm64..."
@@ -110,7 +101,25 @@ jobs:
               -f services/${{ matrix.service }}/Dockerfile -t $IMAGE .
           fi
 
-      # ── DEPLOY (runs immediately after this service's build succeeds) ────────
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [setup-matrix, build]
+    # run even if some builds failed — deploy what succeeded, skip what didn't
+    if: always() && needs.setup-matrix.result == 'success'
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
+      OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
+
+    steps:
+      - name: Checkout Private Monorepo
+        uses: actions/checkout@v4.1.0
+        with:
+          repository: 'Ninja-Deals/ninjadeals-main'
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
       - name: Set up OCI CLI
         uses: oracle-actions/run-oci-cli-command@v1.3.2
         with:
@@ -122,7 +131,7 @@ jobs:
           tr -d '\n\r' < infra/bastion_key.pub > b_key.pub
           SESSION_ID=$(oci bastion session create-port-forwarding \
             --bastion-id ${{ secrets.BASTION_ID }} \
-            --display-name "deploy-${{ matrix.service }}-$(date +%s)" \
+            --display-name "deploy-all-$(date +%s)" \
             --ssh-public-key-file b_key.pub \
             --target-private-ip 10.0.30.20 \
             --target-port 22 \
@@ -139,13 +148,13 @@ jobs:
             echo "Session state: $STATE"
             if [ "$STATE" == "ACTIVE" ]; then break; fi
             if [ "$STATE" == "FAILED" ] || [ "$STATE" == "DELETED" ]; then
-              echo "Bastion session failed to become active"
+              echo "Bastion session failed"
               exit 1
             fi
             sleep 10
           done
 
-      - name: Deploy ${{ matrix.service }}
+      - name: Open Bastion Tunnel
         run: |
           SSH_CMD=$(oci bastion session get \
             --session-id ${{ steps.create_session.outputs.session_id }} \
@@ -172,33 +181,62 @@ jobs:
 
           echo "Opening bastion tunnel..."
           $FINAL_SSH_CMD &
-          TUNNEL_PID=$!
+          echo $! > tunnel.pid
 
           for i in {1..30}; do
             if nc -z localhost 2222; then
               echo "Tunnel established."
               break
             fi
-            if ! kill -0 $TUNNEL_PID 2>/dev/null; then
+            if ! kill -0 $(cat tunnel.pid) 2>/dev/null; then
               echo "ERROR: Tunnel process died."
               exit 1
             fi
             sleep 2
           done
 
-          echo "Pulling and restarting ${{ matrix.service }}..."
+      - name: Deploy All Services in Parallel
+        run: |
+          SERVICES="${{ needs.setup-matrix.outputs.services_list }}"
+          echo "Deploying in parallel: $SERVICES"
+
+          # Each service: pull new image + restart, all fired as background jobs.
+          # Results collected at the end; individual failures don't abort others.
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
-            "cd /opt/ninjadeals/services && \
-             sudo docker compose -f services.yml pull ${{ matrix.service }} && \
-             sudo docker compose -f services.yml up -d ${{ matrix.service }} && \
-             echo '✓ ${{ matrix.service }} deployed successfully'"
+            "cd /opt/ninjadeals/services
+             declare -A pids
+             for svc in $SERVICES; do
+               (
+                 if sudo docker compose -f services.yml pull \$svc 2>&1 | tail -1 && \
+                    sudo docker compose -f services.yml up -d \$svc 2>&1; then
+                   echo \"[OK]  \$svc deployed\"
+                 else
+                   echo \"[FAIL] \$svc deploy failed\" >&2
+                   exit 1
+                 fi
+               ) &
+               pids[\$svc]=\$!
+             done
 
-          kill $TUNNEL_PID || true
+             # Wait for all and collect exit codes
+             overall=0
+             for svc in \"\${!pids[@]}\"; do
+               if ! wait \${pids[\$svc]}; then
+                 echo \"[FAIL] \$svc\" >&2
+                 overall=1
+               fi
+             done
 
-      - name: Cleanup Bastion Session
+             echo \"---\"
+             echo \"Deploy complete. Containers:\"
+             sudo docker compose -f services.yml ps --format 'table {{.Name}}\t{{.Status}}'
+             exit \$overall"
+
+      - name: Cleanup Bastion Tunnel and Session
         if: always()
         run: |
+          [ -f tunnel.pid ] && kill $(cat tunnel.pid) 2>/dev/null || true
           if [ -n "${{ steps.create_session.outputs.session_id }}" ]; then
             oci bastion session delete \
               --session-id ${{ steps.create_session.outputs.session_id }} \
