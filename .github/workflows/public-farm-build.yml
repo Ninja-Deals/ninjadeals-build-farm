@@ -126,7 +126,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: deploy
-      cancel-in-progress: true
+      cancel-in-progress: false
 
     env:
       OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
