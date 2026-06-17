@@ -16,10 +16,6 @@ env:
   REGISTRY: ghcr.io
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
-concurrency:
-  group: deploy
-  cancel-in-progress: true
-
 jobs:
   # ── SETUP ───────────────────────────────────────────────────────────────────
   # Resolve which services to build. No bastion work here.
@@ -128,6 +124,9 @@ jobs:
   deploy:
     needs: [setup, build]
     runs-on: ubuntu-latest
+    concurrency:
+      group: deploy
+      cancel-in-progress: true
 
     env:
       OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
