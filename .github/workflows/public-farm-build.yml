@@ -256,7 +256,8 @@ jobs:
           echo "Pulling and restarting ${{ matrix.service }}..."
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
-            "cd /opt/ninjadeals/services && \
+            "sudo docker image prune -af --filter 'until=24h' 2>/dev/null || true && \
+             cd /opt/ninjadeals/services && \
              sudo docker compose -f services.yml pull ${{ matrix.service }} && \
              sudo docker compose -f services.yml up -d ${{ matrix.service }} && \
              echo '✓ ${{ matrix.service }} deployed'"
