@@ -11,11 +11,26 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  setup-matrix:
+  # Creates the service matrix AND one shared bastion session upfront.
+  # All build-and-deploy jobs reuse this single session — no quota issues.
+  setup:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      session_id: ${{ steps.create_session.outputs.session_id }}
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
+      OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
     steps:
+      - name: Checkout Private Monorepo
+        uses: actions/checkout@v4
+        with:
+          repository: 'Ninja-Deals/ninjadeals-main'
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
       - id: set-matrix
         run: |
           FULL_LIST='["bff","comment","deal","discovery","following","forum","frontend","hello","identity","inbox","indexing-projection","media","moderation","notification","offer","price-collector","price-history","pricing","ranking","reputation","rewards","saved-items","search","user-profile","vote","wallet"]'
@@ -32,15 +47,47 @@ jobs:
 
           echo "matrix={\"service\":$RESULT}" >> $GITHUB_OUTPUT
 
-  # One job per service. Build and bastion session setup run in parallel within
-  # the job — bastion is ready by the time docker push completes, so deploy
-  # starts immediately with no extra wait.
+      - name: Set up OCI CLI
+        uses: oracle-actions/run-oci-cli-command@v1.3.2
+        with:
+          command: 'oci --version'
+
+      - name: Create Shared Bastion Session
+        id: create_session
+        run: |
+          tr -d '\n\r' < infra/bastion_key.pub > b_key.pub
+          SESSION_ID=$(oci bastion session create-port-forwarding \
+            --bastion-id ${{ secrets.BASTION_ID }} \
+            --display-name "deploy-$(date +%s)" \
+            --ssh-public-key-file b_key.pub \
+            --target-private-ip 10.0.30.20 \
+            --target-port 22 \
+            --session-ttl 1800 \
+            --query "data.id" --raw-output)
+          echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for Session ACTIVE
+        run: |
+          for i in {1..30}; do
+            STATE=$(oci bastion session get \
+              --session-id ${{ steps.create_session.outputs.session_id }} \
+              --query "data.\"lifecycle-state\"" --raw-output)
+            echo "Session state: $STATE"
+            if [ "$STATE" == "ACTIVE" ]; then break; fi
+            if [ "$STATE" == "FAILED" ] || [ "$STATE" == "DELETED" ]; then
+              echo "Bastion session failed"; exit 1
+            fi
+            sleep 10
+          done
+
+  # Each service builds its image then immediately deploys via the shared
+  # bastion session — all 26 run in parallel, each with its own SSH tunnel.
   build-and-deploy:
-    needs: setup-matrix
+    needs: setup
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false   # one service failing does NOT cancel others
-      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
 
     permissions:
       contents: read
@@ -55,17 +102,10 @@ jobs:
 
     steps:
       - name: Checkout Private Monorepo
-        uses: actions/checkout@v4   # v4.2+ uses Node.js 24
+        uses: actions/checkout@v4
         with:
           repository: 'Ninja-Deals/ninjadeals-main'
           token: ${{ secrets.PRIVATE_REPO_PAT }}
-
-      # Set up OCI CLI before the build step so it's available to the
-      # background bastion process that runs during docker build.
-      - name: Set up OCI CLI
-        uses: oracle-actions/run-oci-cli-command@v1.3.2
-        with:
-          command: 'oci --version'
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -91,48 +131,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.PRIVATE_REPO_PAT }}
 
-      # Bastion session creation (~30-60s) runs in the background while
-      # docker build+push (~2 min) runs in the foreground. By the time the
-      # image is pushed the session is already ACTIVE — deploy starts immediately.
-      - name: Build, Push and Prepare Bastion in Parallel
+      # ── BUILD ────────────────────────────────────────────────────────────────
+      - name: Build and Push for ARM64
         run: |
-          # ── Background: create & wait for bastion session ─────────────────
-          (
-            tr -d '\n\r' < infra/bastion_key.pub > /tmp/b_key.pub
-            SESSION_ID=$(oci bastion session create-port-forwarding \
-              --bastion-id ${{ secrets.BASTION_ID }} \
-              --display-name "deploy-${{ matrix.service }}-$(date +%s)" \
-              --ssh-public-key-file /tmp/b_key.pub \
-              --target-private-ip 10.0.30.20 \
-              --target-port 22 \
-              --session-ttl 1800 \
-              --query "data.id" --raw-output 2>/tmp/session_err || echo "")
-
-            if [ -z "$SESSION_ID" ] || [ "$SESSION_ID" = "null" ]; then
-              echo "FAILED:create" > /tmp/session_state
-              exit 1
-            fi
-
-            echo "$SESSION_ID" > /tmp/session_id
-
-            for i in {1..30}; do
-              STATE=$(oci bastion session get \
-                --session-id "$SESSION_ID" \
-                --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null || echo "UNKNOWN")
-              if [ "$STATE" = "ACTIVE" ]; then
-                echo "ACTIVE" > /tmp/session_state
-                break
-              fi
-              if [ "$STATE" = "FAILED" ] || [ "$STATE" = "DELETED" ]; then
-                echo "FAILED:$STATE" > /tmp/session_state
-                break
-              fi
-              sleep 10
-            done
-          ) &
-          echo $! > /tmp/bastion_pid
-
-          # ── Foreground: build and push image ─────────────────────────────
+          echo "Building ${{ matrix.service }} for linux/arm64..."
           IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:latest"
           if [ "${{ matrix.service }}" = "frontend" ]; then
             docker buildx build --platform linux/arm64 \
@@ -154,21 +156,15 @@ jobs:
               -f services/${{ matrix.service }}/Dockerfile -t $IMAGE .
           fi
 
-          # ── Confirm bastion is ready (should already be done) ────────────
-          echo "Image pushed. Waiting for bastion session (likely already active)..."
-          wait $(cat /tmp/bastion_pid) || true
-
-          STATE=$(cat /tmp/session_state 2>/dev/null || echo "MISSING")
-          if [ "$STATE" != "ACTIVE" ]; then
-            echo "ERROR: Bastion session not active: $STATE"
-            cat /tmp/session_err 2>/dev/null || true
-            exit 1
-          fi
-          echo "Bastion session is ACTIVE — deploying immediately."
+      # ── DEPLOY (immediately after this service's build, via shared session) ─
+      - name: Set up OCI CLI
+        uses: oracle-actions/run-oci-cli-command@v1.3.2
+        with:
+          command: 'oci --version'
 
       - name: Deploy ${{ matrix.service }}
         run: |
-          SESSION_ID=$(cat /tmp/session_id)
+          SESSION_ID="${{ needs.setup.outputs.session_id }}"
 
           SSH_CMD=$(oci bastion session get \
             --session-id "$SESSION_ID" \
@@ -219,12 +215,25 @@ jobs:
 
           kill $TUNNEL_PID || true
 
-      - name: Cleanup Bastion Session
-        if: always()
+  # Cleans up the shared bastion session after all jobs finish (or fail).
+  teardown:
+    needs: [setup, build-and-deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
+      OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
+    steps:
+      - name: Set up OCI CLI
+        uses: oracle-actions/run-oci-cli-command@v1.3.2
+        with:
+          command: 'oci --version'
+
+      - name: Delete Shared Bastion Session
         run: |
-          SESSION_ID=$(cat /tmp/session_id 2>/dev/null || echo "")
-          if [ -n "$SESSION_ID" ]; then
-            oci bastion session delete \
-              --session-id "$SESSION_ID" \
-              --force || true
-          fi
+          oci bastion session delete \
+            --session-id ${{ needs.setup.outputs.session_id }} \
+            --force || true
