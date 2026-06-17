@@ -11,6 +11,12 @@ env:
   REGISTRY: ghcr.io
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
+# Only one deploy run at a time. A new push cancels the in-progress run;
+# teardown (if: always) still fires on the cancelled run to clean up the session.
+concurrency:
+  group: deploy
+  cancel-in-progress: true
+
 jobs:
   # Creates the service matrix AND one shared bastion session upfront.
   # All build-and-deploy jobs look up the active session directly from OCI
@@ -70,7 +76,7 @@ jobs:
           tr -d '\n\r' < infra/bastion_key.pub > b_key.pub
           SESSION_ID=$(oci bastion session create-port-forwarding \
             --bastion-id ${{ secrets.BASTION_ID }} \
-            --display-name "deploy-$(date +%s)" \
+            --display-name "deploy-${{ github.run_id }}" \
             --ssh-public-key-file b_key.pub \
             --target-private-ip 10.0.30.20 \
             --target-port 22 \
