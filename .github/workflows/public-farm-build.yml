@@ -12,12 +12,12 @@ env:
 
 jobs:
   # Creates the service matrix AND one shared bastion session upfront.
-  # All build-and-deploy jobs reuse this single session — no quota issues.
+  # All build-and-deploy jobs look up the active session directly from OCI
+  # — no job output propagation needed.
   setup:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
-      session_id: ${{ steps.create_session.outputs.session_id }}
     env:
       OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
       OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
@@ -53,10 +53,8 @@ jobs:
           command: 'oci --version'
 
       - name: Create Shared Bastion Session
-        id: create_session
         run: |
-          # Purge any stale sessions left by previous failed runs to avoid QuotaExceeded.
-          # OCI CLI exits 0 even on errors when --raw-output is used, so we validate manually.
+          # Purge stale sessions first so quota is never exceeded
           echo "Cleaning up stale bastion sessions..."
           STALE=$(oci bastion session list \
             --bastion-id ${{ secrets.BASTION_ID }} \
@@ -66,7 +64,7 @@ jobs:
             echo "Deleting stale session: $old_id"
             oci bastion session delete --session-id "$old_id" --force 2>/dev/null || true
           done
-          [ -n "$STALE" ] && sleep 10  # wait for deletions to propagate
+          [ -n "$STALE" ] && sleep 10
 
           tr -d '\n\r' < infra/bastion_key.pub > b_key.pub
           SESSION_ID=$(oci bastion session create-port-forwarding \
@@ -79,28 +77,32 @@ jobs:
             --query "data.id" --raw-output 2>/tmp/oci_err || true)
 
           if [ -z "$SESSION_ID" ] || [ "$SESSION_ID" = "null" ]; then
-            echo "ERROR: Failed to create bastion session. OCI output:"
+            echo "ERROR: Failed to create bastion session:"
             cat /tmp/oci_err || true
             exit 1
           fi
-
           echo "Created session: $SESSION_ID"
-          echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
 
       - name: Wait for Session ACTIVE
         run: |
-          SESSION_ID="${{ steps.create_session.outputs.session_id }}"
+          # Each deploy job will look up this session by querying ACTIVE sessions —
+          # no need to pass the session_id through job outputs.
           for i in {1..30}; do
-            STATE=$(oci bastion session get \
-              --session-id "$SESSION_ID" \
-              --query "data.\"lifecycle-state\"" --raw-output)
-            echo "Session state: $STATE"
-            if [ "$STATE" == "ACTIVE" ]; then break; fi
-            if [ "$STATE" == "FAILED" ] || [ "$STATE" == "DELETED" ]; then
-              echo "Bastion session failed"; exit 1
+            SESSION_ID=$(oci bastion session list \
+              --bastion-id ${{ secrets.BASTION_ID }} \
+              --session-lifecycle-state ACTIVE \
+              --query "data[0].id" --raw-output 2>/dev/null || true)
+            if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ]; then
+              echo "Session ACTIVE: $SESSION_ID"
+              break
             fi
+            echo "Waiting for session to become active... ($i/30)"
             sleep 10
           done
+          if [ -z "$SESSION_ID" ] || [ "$SESSION_ID" = "null" ]; then
+            echo "ERROR: Session never became active"
+            exit 1
+          fi
 
   # Each service builds its image then immediately deploys via the shared
   # bastion session — all 26 run in parallel, each with its own SSH tunnel.
@@ -186,11 +188,16 @@ jobs:
 
       - name: Deploy ${{ matrix.service }}
         run: |
-          SESSION_ID="${{ needs.setup.outputs.session_id }}"
-          if [ -z "$SESSION_ID" ]; then
-            echo "ERROR: session_id is empty — setup job did not produce a valid bastion session"
+          # Look up the active session created by the setup job — no job output needed
+          SESSION_ID=$(oci bastion session list \
+            --bastion-id ${{ secrets.BASTION_ID }} \
+            --session-lifecycle-state ACTIVE \
+            --query "data[0].id" --raw-output 2>/dev/null || true)
+          if [ -z "$SESSION_ID" ] || [ "$SESSION_ID" = "null" ]; then
+            echo "ERROR: No active bastion session found"
             exit 1
           fi
+          echo "Using session: $SESSION_ID"
 
           SSH_CMD=$(oci bastion session get \
             --session-id "$SESSION_ID" \
@@ -260,6 +267,11 @@ jobs:
 
       - name: Delete Shared Bastion Session
         run: |
-          oci bastion session delete \
-            --session-id ${{ needs.setup.outputs.session_id }} \
-            --force || true
+          SESSIONS=$(oci bastion session list \
+            --bastion-id ${{ secrets.BASTION_ID }} \
+            --session-lifecycle-state ACTIVE \
+            --query "data[*].id" --raw-output 2>/dev/null || true)
+          for sid in $SESSIONS; do
+            echo "Deleting session: $sid"
+            oci bastion session delete --session-id "$sid" --force || true
+          done
