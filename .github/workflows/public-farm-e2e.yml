@@ -20,7 +20,9 @@ on:
 
 env:
   REPO: Ninja-Deals/ninjadeals-main
-  STAGING_URL: https://staging.ninja.deals
+  # Hit the OCI instance directly to bypass Cloudflare's bot challenge (which blocks
+  # headless browsers from public runners). Override via the E2E_BASE_URL repo variable.
+  STAGING_URL: ${{ vars.E2E_BASE_URL || 'http://140.245.247.30' }}
 
 jobs:
   e2e:
@@ -33,9 +35,11 @@ jobs:
         run: |
           ISSUE='${{ github.event.client_payload.issue || inputs.issue }}'
           BRANCH='${{ github.event.client_payload.branch || inputs.branch }}'
+          SPECS='${{ github.event.client_payload.specs }}'
           echo "issue=$ISSUE" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "Running e2e for issue #$ISSUE on branch $BRANCH"
+          echo "specs=$SPECS" >> "$GITHUB_OUTPUT"
+          echo "Running e2e for issue #$ISSUE on branch $BRANCH (specs='${SPECS:-all}')"
 
       - name: Checkout monorepo @ e2e branch
         uses: actions/checkout@v6
@@ -66,7 +70,7 @@ jobs:
           E2E_USER_PASSWORD: ${{ secrets.E2E_USER_PASSWORD }}
         run: |
           set +e
-          npx playwright test --reporter=json,html > e2e-results.json 2> e2e-stderr.txt
+          npx playwright test ${{ steps.in.outputs.specs }} --reporter=json,html > e2e-results.json 2> e2e-stderr.txt
           echo "exit=$?" >> "$GITHUB_OUTPUT"
 
       - name: Upload report + traces
