@@ -35,7 +35,7 @@ jobs:
         run: |
           ISSUE='${{ github.event.client_payload.issue || inputs.issue }}'
           BRANCH='${{ github.event.client_payload.branch || inputs.branch }}'
-          SPECS='${{ github.event.client_payload.specs }}'
+          SPECS='${{ github.event.client_payload.specs || vars.E2E_SPECS }}'
           echo "issue=$ISSUE" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "specs=$SPECS" >> "$GITHUB_OUTPUT"
