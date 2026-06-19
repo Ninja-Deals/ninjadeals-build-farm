@@ -1,0 +1,138 @@
+name: Public Farm E2E (Playwright vs staging)
+
+# Triggered by the orchestrator's e2e-write agent (via scripts/e2e/trigger-e2e.sh)
+# once it has pushed Playwright specs on the e2e/<issue> branch. Runs the specs
+# against staging, then reports the result back by labelling the monorepo issue
+# (e2e:pass / e2e:fail) + commenting structured stats — the orchestrator reacts
+# via the GitHub webhook it already receives.
+on:
+  repository_dispatch:
+    types: [trigger-e2e]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: 'Issue number to report back to'
+        required: true
+      branch:
+        description: 'Branch with the e2e specs (e.g. e2e/123)'
+        required: true
+        default: 'main'
+
+env:
+  REPO: Ninja-Deals/ninjadeals-main
+  STAGING_URL: https://staging.ninja.deals
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve inputs
+        id: in
+        run: |
+          ISSUE='${{ github.event.client_payload.issue || inputs.issue }}'
+          BRANCH='${{ github.event.client_payload.branch || inputs.branch }}'
+          echo "issue=$ISSUE" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Running e2e for issue #$ISSUE on branch $BRANCH"
+
+      - name: Checkout monorepo @ e2e branch
+        uses: actions/checkout@v6
+        with:
+          repository: Ninja-Deals/ninjadeals-main
+          ref: ${{ steps.in.outputs.branch }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install deps + browsers
+        working-directory: frontend
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run Playwright vs staging
+        id: run
+        working-directory: frontend
+        continue-on-error: true
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ env.STAGING_URL }}
+          # Optional seeded-account creds for authenticated journeys (globalSetup).
+          E2E_USER_EMAIL: ${{ secrets.E2E_USER_EMAIL }}
+          E2E_USER_PASSWORD: ${{ secrets.E2E_USER_PASSWORD }}
+        run: |
+          set +e
+          npx playwright test --reporter=json,html > e2e-results.json 2> e2e-stderr.txt
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Upload report + traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ steps.in.outputs.issue }}
+          path: |
+            frontend/playwright-report
+            frontend/e2e-results.json
+            frontend/e2e-stderr.txt
+          if-no-files-found: ignore
+
+      - name: Report result to the issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          ISSUE: ${{ steps.in.outputs.issue }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - "$ISSUE" "$RUN_URL" <<'PY'
+          import json, os, subprocess, sys
+          issue, run_url = sys.argv[1], sys.argv[2]
+          repo = os.environ["REPO"]
+          passed = failed = flaky = skipped = 0
+          failing = []
+          try:
+              with open("frontend/e2e-results.json") as f:
+                  data = json.load(f)
+              st = data.get("stats", {})
+              passed = st.get("expected", 0)
+              failed = st.get("unexpected", 0)
+              flaky = st.get("flaky", 0)
+              skipped = st.get("skipped", 0)
+              def walk(suite, trail):
+                  for sp in suite.get("specs", []):
+                      if not sp.get("ok", True):
+                          failing.append("/".join(trail + [sp.get("title", "?")]))
+                  for ch in suite.get("suites", []):
+                      walk(ch, trail + [ch.get("title", "")])
+              for s in data.get("suites", []):
+                  walk(s, [s.get("title", "")])
+          except Exception as e:
+              failed = failed or 1
+              failing.append(f"(could not parse Playwright JSON: {e})")
+
+          ok = failed == 0 and passed >= 0 and os.path.exists("frontend/e2e-results.json") and \
+               (passed + failed + skipped) > 0
+          label = "e2e:pass" if ok else "e2e:fail"
+          lines = [
+              f"### 🧪 E2E results ({'pass' if ok else 'FAIL'})",
+              "",
+              f"| passed | failed | flaky | skipped |",
+              f"|---|---|---|---|",
+              f"| {passed} | {failed} | {flaky} | {skipped} |",
+              "",
+              run_url,
+          ]
+          if failing:
+              lines += ["", "**Failing:**"] + [f"- `{x}`" for x in failing[:50]]
+          body = "\n".join(lines)
+
+          def gh(*args, **kw):
+              return subprocess.run(["gh", *args], check=True, **kw)
+          gh("api", f"repos/{repo}/issues/{issue}/comments", "-X", "POST", "-f", f"body={body}")
+          gh("api", f"repos/{repo}/issues/{issue}/labels", "-X", "POST", "-f", f"labels[]={label}")
+          print(f"reported {label}: passed={passed} failed={failed}")
+          PY
