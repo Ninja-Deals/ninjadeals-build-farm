@@ -275,12 +275,14 @@ jobs:
         run: kill $(cat /tmp/tunnel_pid) 2>/dev/null || true
 
   # ── NOTIFY ───────────────────────────────────────────────────────────────────
-  # Report the deploy outcome back to the orchestrator. On success the issue
-  # advances done → verifying (which triggers integration/e2e); on failure the
-  # complete error log is posted to the issue so it can be re-fixed.
+  # Report the deploy outcome back to the orchestrator by labelling the issue in
+  # the private monorepo (deploy:success / deploy:failed). The orchestrator reacts
+  # via the GitHub webhook it already receives — this routes around the Cloudflare
+  # Bot Fight Mode challenge that blocks a direct POST. On failure the complete
+  # error log is posted as an issue comment so the issue can be re-fixed.
   #
-  # Driven entirely off the repository_dispatch client_payload.issue so manual /
-  # push builds (no issue) simply skip the callback.
+  # Driven off the repository_dispatch client_payload.issue, so manual / push
+  # builds (no issue) simply skip the report.
   notify:
     needs: [setup, build, deploy]
     if: always() && github.event.client_payload.issue != ''
@@ -289,15 +291,12 @@ jobs:
       contents: read
       actions: read
     steps:
-      - name: Post deploy result to orchestrator
+      - name: Report deploy result to the issue
         env:
-          # Shared HMAC secret — must equal DEPLOY_CALLBACK_SECRET on the orchestrator.
-          CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
-          # Orchestrator ingress (Cloudflare tunnel). Override via repo variable if needed.
-          CALLBACK_URL: ${{ vars.DEPLOY_CALLBACK_URL || 'https://hooks.ninja.deals/api/webhooks/deploy' }}
-          GH_TOKEN: ${{ github.token }}
+          # PAT with access to the private monorepo (same token used for checkout).
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          REPO: Ninja-Deals/ninjadeals-main
           ISSUE: ${{ github.event.client_payload.issue }}
-          SHA: ${{ github.event.client_payload.sha }}
           BUILD_RESULT: ${{ needs.build.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -305,46 +304,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Overall status: success only when both build and deploy succeeded.
+          add_label() {  # add a label to the issue (label is pre-created in the repo)
+            gh api "repos/$REPO/issues/$ISSUE/labels" -X POST -f "labels[]=$1" >/dev/null
+          }
+          comment() { gh api "repos/$REPO/issues/$ISSUE/comments" -X POST -f body="$1" >/dev/null; }
+
           if [ "$BUILD_RESULT" = "success" ] && [ "$DEPLOY_RESULT" = "success" ]; then
-            STATUS="success"
-            LOG=""
+            echo "Deploy succeeded for issue #$ISSUE"
+            comment "🚀 Build-farm deploy to \`staging\` succeeded. ${RUN_URL}"
+            add_label "deploy:success"
           else
-            STATUS="failure"
-            # Pull the logs of any failed job in this run so the issue carries the
-            # complete error (truncated to keep the payload sane).
+            echo "Deploy failed for issue #$ISSUE — gathering logs"
             LOG=""
-            JOBS=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100")
+            JOBS=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100")
             for jid in $(echo "$JOBS" | jq -r '.jobs[] | select(.conclusion=="failure") | .id'); do
-              JLOG=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${jid}/logs" || true)
+              JLOG=$(gh api "repos/${{ github.repository }}/actions/jobs/${jid}/logs" 2>/dev/null || true)
               LOG="${LOG}
           ===== failed job ${jid} =====
           ${JLOG}"
             done
-            # Keep the last ~40KB — that's where the error is.
-            LOG=$(printf '%s' "$LOG" | tail -c 40000)
+            LOG=$(printf '%s' "$LOG" | tail -c 30000)
+            comment "$(printf '%s\n\n%s\n\n```\n%s\n```' '❌ Build-farm deploy **failed** — staying at `status:done`, flagging for human review.' "$RUN_URL" "$LOG")"
+            add_label "deploy:failed"
           fi
-
-          # Build the JSON body and HMAC-sign it exactly as the orchestrator verifies.
-          BODY=$(jq -nc \
-            --arg issue "$ISSUE" \
-            --arg sha "$SHA" \
-            --arg status "$STATUS" \
-            --arg run_url "$RUN_URL" \
-            --arg log "$LOG" \
-            '{issue: ($issue|tonumber), sha: $sha, status: $status, run_url: $run_url, log: $log}')
-
-          SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$CALLBACK_SECRET" | sed 's/^.* //')"
-
-          echo "Posting deploy result: status=$STATUS issue=$ISSUE"
-          curl -sS -X POST "$CALLBACK_URL" \
-            -H "Content-Type: application/json" \
-            -H "X-Hub-Signature-256: $SIG" \
-            --data-binary "$BODY" \
-            --fail-with-body
 
   # ── TEARDOWN ─────────────────────────────────────────────────────────────────
   teardown:
