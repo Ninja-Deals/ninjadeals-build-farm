@@ -103,6 +103,7 @@ jobs:
           IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:latest"
           if [ "${{ matrix.service }}" = "frontend" ]; then
             docker buildx build --platform linux/arm64 \
+              --build-arg NEXT_PUBLIC_CAPTCHA_ENABLED=false \
               --cache-from=type=gha,scope=frontend \
               --cache-to=type=gha,mode=max,scope=frontend \
               --push -f frontend/Dockerfile -t $IMAGE frontend/
