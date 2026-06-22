@@ -260,6 +260,22 @@ jobs:
             exit 1
           fi
 
+      - name: Sync compose file from monorepo to host
+        run: |
+          # The host's /opt/ninjadeals/services/services.yml was only ever seeded by
+          # cloud-init and then drifted from git — so monorepo changes to the compose
+          # config (e.g. IDENTITY_CAPTCHA_ENABLED defaults, new env vars) never reached
+          # staging via this deploy. Push the checked-out monorepo copy on every deploy so
+          # git is the single source of truth for compose config. Runtime secrets stay in
+          # the host .env (untouched here). `up -d` below re-reads both.
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o IdentitiesOnly=yes -i d_key -P 2222 \
+            infra/compose/services.yml opc@127.0.0.1:/tmp/services.yml
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
+            "sudo cp /tmp/services.yml /opt/ninjadeals/services/services.yml && rm -f /tmp/services.yml"
+          echo "services.yml synced from monorepo to host."
+
       - name: Deploy All Services
         run: |
           echo "Deploying: $SERVICES"
