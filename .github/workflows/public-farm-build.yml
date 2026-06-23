@@ -104,6 +104,7 @@ jobs:
           if [ "${{ matrix.service }}" = "frontend" ]; then
             docker buildx build --platform linux/arm64 \
               --build-arg NEXT_PUBLIC_CAPTCHA_ENABLED=false \
+              --build-arg NEXT_PUBLIC_OLA_MAPS_API_KEY="${{ secrets.NEXT_PUBLIC_OLA_MAPS_API_KEY }}" \
               --cache-from=type=gha,scope=frontend \
               --cache-to=type=gha,mode=max,scope=frontend \
               --push -f frontend/Dockerfile -t $IMAGE frontend/
