@@ -229,9 +229,17 @@ jobs:
           #
           # Fix: retry the SSH connection ITSELF with backoff until the bastion key has
           # propagated. nc only confirms the port is up for an attempt that survived.
+          #
+          # SECOND ROOT CAUSE (job hangs after all steps go green): the backgrounded
+          # tunnel inherits this step's stdout/stderr — i.e. the Actions runner's live
+          # log pipe. On success we `exit 0` and leave the tunnel running, so the
+          # orphaned ssh keeps that pipe open and the runner never finalises the job
+          # (deploy stays "in_progress" forever, blocking teardown and leaking bastion
+          # sessions, which then re-fuels the deploy cron's re-dispatch loop). Detaching
+          # the tunnel's three std FDs to a file releases the pipe so the job can end.
           TUNNEL_PID=""
           for attempt in $(seq 1 8); do
-            $FINAL &
+            $FINAL </dev/null >>/tmp/tunnel.log 2>&1 &
             TUNNEL_PID=$!
             echo "$TUNNEL_PID" > /tmp/tunnel_pid
             # Give this attempt up to ~10s to bring the local forward up.
@@ -301,7 +309,14 @@ jobs:
 
       - name: Close Tunnel
         if: always()
-        run: kill $(cat /tmp/tunnel_pid) 2>/dev/null || true
+        run: |
+          # Kill the recorded tunnel pid, then sweep any stragglers by the unique
+          # local-forward pattern so no ssh child survives to hold the job's log
+          # pipe open (which would hang job finalisation even with FDs detached).
+          kill "$(cat /tmp/tunnel_pid 2>/dev/null)" 2>/dev/null || true
+          pkill -f 'ssh .*-L 2222:' 2>/dev/null || true
+          # Never let cleanup fail the job.
+          exit 0
 
   # ── NOTIFY ───────────────────────────────────────────────────────────────────
   # Report the deploy outcome back to the orchestrator by labelling the issue in
