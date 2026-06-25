@@ -201,31 +201,53 @@ jobs:
 
       - name: Open Bastion Tunnel
         run: |
-          SESSION_ID=$(oci bastion session list \
-            --bastion-id ${{ secrets.BASTION_ID }} \
-            --session-lifecycle-state ACTIVE \
-            --query "data[0].id" --raw-output)
-
-          SSH_CMD=$(oci bastion session get \
-            --session-id "$SESSION_ID" \
-            --query "data.\"ssh-metadata\".command" --raw-output)
-
-          if [ -n "${{ secrets.BASTION_PRIVATE_KEY }}" ]; then
-            echo "${{ secrets.BASTION_PRIVATE_KEY }}" > b_key
-          else
-            cp infra/bastion_key b_key
-          fi
-          chmod 600 b_key
-
+          # Use the deploy key for BOTH the bastion hop and the apps-VM login
+          # (mirrors scripts/bastion/ssh-bastion.sh in the monorepo). The session
+          # is registered with this key's public half, so the hop must present the
+          # same key — the previous split (b_key for the hop) only worked when the
+          # reused session happened to be registered with that key.
           if [ -n "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
             echo "${{ secrets.SSH_PRIVATE_KEY }}" > d_key
           else
             cp infra/deploy_ssh_key d_key
           fi
           chmod 600 d_key
+          ssh-keygen -y -f d_key > d_key.pub
+
+          # Create a DEDICATED port-forwarding session to the apps VM rather than
+          # reusing an arbitrary active session (the old `--query data[0].id`). With
+          # concurrent sessions (parallel deploys, or a session to the platform VM)
+          # `data[0]` frequently targets a DIFFERENT host, so the tunnel forwarded to
+          # the wrong VM and the "verify apps host is bootstrapped" preflight failed
+          # even though the apps host was perfectly fine. A dedicated session is
+          # deterministic. Apps private IP defaults to 10.0.30.20 (see monorepo
+          # agents-information/docs/INFRA_ACCESS.md); override via secrets.APPS_PRIVATE_IP.
+          APPS_IP="${{ secrets.APPS_PRIVATE_IP }}"
+          APPS_IP="${APPS_IP:-10.0.30.20}"
+          SESSION_ID=$(oci bastion session create-port-forwarding \
+            --bastion-id ${{ secrets.BASTION_ID }} \
+            --display-name "build-farm-deploy-$(date +%s)" \
+            --ssh-public-key-file d_key.pub \
+            --target-private-ip "$APPS_IP" --target-port 22 \
+            --query "data.id" --raw-output)
+          echo "$SESSION_ID" > /tmp/session_id
+
+          echo "Waiting for bastion session $SESSION_ID to become ACTIVE..."
+          for i in {1..45}; do
+            STATE=$(oci bastion session get --session-id "$SESSION_ID" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null || echo UNKNOWN)
+            [ "$STATE" = "ACTIVE" ] && break
+            if [ "$STATE" = "FAILED" ] || [ "$STATE" = "DELETED" ]; then
+              echo "ERROR: bastion session entered state $STATE"; exit 1
+            fi
+            sleep 2
+          done
+
+          SSH_CMD=$(oci bastion session get \
+            --session-id "$SESSION_ID" \
+            --query "data.\"ssh-metadata\".command" --raw-output)
 
           FINAL=$(echo "$SSH_CMD" \
-            | sed "s|<privateKey>|b_key|g" \
+            | sed "s|<privateKey>|d_key|g" \
             | sed "s|<localPort>|2222|g" \
             | sed "s|ssh |ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes |")
 
@@ -234,7 +256,7 @@ jobs:
 
           for i in {1..30}; do
             if nc -z localhost 2222 2>/dev/null; then
-              echo "Tunnel established."
+              echo "Tunnel established to apps VM ($APPS_IP)."
               exit 0
             fi
             sleep 2
