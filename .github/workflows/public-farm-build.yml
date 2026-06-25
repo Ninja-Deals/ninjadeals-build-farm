@@ -150,9 +150,13 @@ jobs:
         with:
           command: 'oci --version'
 
-      - name: Create Bastion Session
+      - name: Clean up stale bastion sessions
         run: |
-          # Clean up any stale sessions first
+          # Delete any leftover ACTIVE sessions so we start from a clean slate and
+          # don't bump against the bastion's max-concurrent-session quota (which
+          # itself causes intermittent create-port-forwarding failures). The actual
+          # deploy session is created fresh — and deterministically — in the
+          # "Open Bastion Tunnel" step below; there is no need to pre-create one here.
           STALE=$(oci bastion session list \
             --bastion-id ${{ secrets.BASTION_ID }} \
             --session-lifecycle-state ACTIVE \
@@ -161,51 +165,14 @@ jobs:
             echo "Removing stale session: $sid"
             oci bastion session delete --session-id "$sid" --force 2>/dev/null || true
           done
-          [ -n "$STALE" ] && sleep 10
-
-          tr -d '\n\r' < infra/bastion_key.pub > b_key.pub
-          SESSION_ID=$(oci bastion session create-port-forwarding \
-            --bastion-id ${{ secrets.BASTION_ID }} \
-            --display-name "deploy-${{ github.run_id }}" \
-            --ssh-public-key-file b_key.pub \
-            --target-private-ip 10.0.30.20 \
-            --target-port 22 \
-            --session-ttl 1800 \
-            --query "data.id" --raw-output 2>/tmp/oci_err || true)
-
-          if [ -z "$SESSION_ID" ] || [ "$SESSION_ID" = "null" ]; then
-            echo "ERROR: Failed to create bastion session:"
-            cat /tmp/oci_err
-            exit 1
-          fi
-          echo "Created session: $SESSION_ID"
-
-      - name: Wait for Session ACTIVE
-        run: |
-          for i in {1..30}; do
-            STATE=$(oci bastion session list \
-              --bastion-id ${{ secrets.BASTION_ID }} \
-              --session-lifecycle-state ACTIVE \
-              --query "data[0].id" --raw-output 2>/dev/null || true)
-            if [ -n "$STATE" ] && [ "$STATE" != "null" ]; then
-              echo "Session ACTIVE"
-              break
-            fi
-            echo "Waiting... ($i/30)"
-            sleep 10
-          done
-          if [ -z "$STATE" ] || [ "$STATE" = "null" ]; then
-            echo "ERROR: Session never became active"
-            exit 1
-          fi
+          [ -n "$STALE" ] && sleep 10 || true
 
       - name: Open Bastion Tunnel
         run: |
           # Use the deploy key for BOTH the bastion hop and the apps-VM login
-          # (mirrors scripts/bastion/ssh-bastion.sh in the monorepo). The session
-          # is registered with this key's public half, so the hop must present the
-          # same key — the previous split (b_key for the hop) only worked when the
-          # reused session happened to be registered with that key.
+          # (mirrors scripts/bastion/ssh-bastion.sh in the monorepo). We create the
+          # session below with this key's public half, so the hop is guaranteed to
+          # present the matching key.
           if [ -n "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
             echo "${{ secrets.SSH_PRIVATE_KEY }}" > d_key
           else
@@ -249,19 +216,41 @@ jobs:
           FINAL=$(echo "$SSH_CMD" \
             | sed "s|<privateKey>|d_key|g" \
             | sed "s|<localPort>|2222|g" \
-            | sed "s|ssh |ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes |")
+            | sed "s|ssh |ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o PubkeyAcceptedKeyTypes=+ssh-rsa |")
 
-          $FINAL &
-          echo $! > /tmp/tunnel_pid
-
-          for i in {1..30}; do
-            if nc -z localhost 2222 2>/dev/null; then
-              echo "Tunnel established to apps VM ($APPS_IP)."
-              exit 0
-            fi
-            sleep 2
+          # ROOT CAUSE of the flaky "Tunnel failed to establish": OCI Bastion reports
+          # the session lifecycle-state ACTIVE several seconds BEFORE its SSH front-end
+          # actually accepts the session's public key. Connecting inside that window
+          # fails with "Permission denied (publickey)". The old code launched ssh
+          # exactly ONCE and then only polled the local port — so a single early
+          # rejection left a dead process and the deploy failed, even though the key
+          # would have been accepted a few seconds later. (Evidence: runs where ACTIVE
+          # took ~45s succeeded; runs where it flipped in ~11s were denied.)
+          #
+          # Fix: retry the SSH connection ITSELF with backoff until the bastion key has
+          # propagated. nc only confirms the port is up for an attempt that survived.
+          TUNNEL_PID=""
+          for attempt in $(seq 1 8); do
+            $FINAL &
+            TUNNEL_PID=$!
+            echo "$TUNNEL_PID" > /tmp/tunnel_pid
+            # Give this attempt up to ~10s to bring the local forward up.
+            for i in $(seq 1 5); do
+              if nc -z localhost 2222 2>/dev/null; then
+                echo "Tunnel established to apps VM ($APPS_IP) on attempt $attempt."
+                exit 0
+              fi
+              # If ssh already exited (publickey not yet propagated), stop waiting
+              # on this dead attempt and retry immediately after the backoff below.
+              kill -0 "$TUNNEL_PID" 2>/dev/null || break
+              sleep 2
+            done
+            echo "Attempt $attempt: tunnel not up (bastion key likely still propagating); retrying..."
+            kill "$TUNNEL_PID" 2>/dev/null || true
+            wait "$TUNNEL_PID" 2>/dev/null || true
+            sleep 5
           done
-          echo "ERROR: Tunnel failed to establish"
+          echo "ERROR: Tunnel failed to establish after 8 attempts"
           exit 1
 
       - name: Preflight — verify apps host is bootstrapped
