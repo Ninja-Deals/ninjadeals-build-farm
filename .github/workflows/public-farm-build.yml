@@ -303,9 +303,26 @@ jobs:
           # build matrix — always include it alongside frontend so both replicas are updated.
           DEPLOY_SERVICES=$(echo "$SERVICES" | sed 's/\bfrontend\b/frontend frontend-2/g')
           echo "Deploying: $DEPLOY_SERVICES"
+          # flock (fd 9 on /tmp/ninja-deploy.lock) serialises this prune+pull+up against
+          # ANY other deploy hitting the same Apps VM — a concurrent deploy.sh run, or a
+          # second build-farm deploy. Without it, two `docker compose pull`s race on the
+          # one docker daemon and the shared cross-cloud ghcr.io pipe; the daemon de-dups
+          # concurrent pulls of the same ref so they end up serialising anyway, but only
+          # after each has crawled — a deploy that's 1-2 min uncontended balloons to 15-20.
+          # The lock makes concurrent deploys QUEUE. deploy.sh in the monorepo flocks this
+          # SAME path. opc owns the lock file (no sudo on the exec, so the fd always opens);
+          # it auto-releases when this ssh session's fd 9 closes. -w 1200 waits up to 20 min.
+          #
+          # `docker image prune -f` reclaims ALL dangling layers (old :latest versions
+          # orphaned by every deploy). The previous `-af --filter until=24h` reclaimed
+          # NOTHING on a repo that deploys many times/day (every dangling layer <24h old),
+          # so the apps-VM disk crept toward full. Plain `-f` (dangling only, any age)
+          # never touches a tagged or in-use image.
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
-            "sudo docker image prune -af --filter 'until=24h' 2>/dev/null || true && \
+            "exec 9>/tmp/ninja-deploy.lock; \
+             flock -w 1200 9 || { echo 'deploy-lock: timed out waiting for a concurrent deploy to release the lock'; exit 1; }; \
+             sudo docker image prune -f 2>/dev/null || true; \
              cd /opt/ninjadeals/services && \
              sudo docker compose -f services.yml pull --quiet $DEPLOY_SERVICES && \
              sudo docker compose -f services.yml up -d $DEPLOY_SERVICES"
