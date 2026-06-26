@@ -107,6 +107,7 @@ jobs:
               --build-arg NEXT_PUBLIC_OLA_MAPS_API_KEY="${{ secrets.NEXT_PUBLIC_OLA_MAPS_API_KEY }}" \
               --cache-from=type=gha,scope=frontend \
               --cache-to=type=gha,mode=max,scope=frontend \
+              --build-arg NEXT_PUBLIC_VAPID_PUBLIC_KEY="${{ secrets.NEXT_PUBLIC_VAPID_PUBLIC_KEY }}" \
               --push -f frontend/Dockerfile -t $IMAGE frontend/
           elif [ "${{ matrix.service }}" = "ranking" ]; then
             docker buildx build --platform linux/arm64 \
