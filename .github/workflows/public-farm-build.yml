@@ -299,13 +299,16 @@ jobs:
 
       - name: Deploy All Services
         run: |
-          echo "Deploying: $SERVICES"
+          # frontend-2 shares the frontend image but is a separate container not in the
+          # build matrix — always include it alongside frontend so both replicas are updated.
+          DEPLOY_SERVICES=$(echo "$SERVICES" | sed 's/\bfrontend\b/frontend frontend-2/g')
+          echo "Deploying: $DEPLOY_SERVICES"
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
             "sudo docker image prune -af --filter 'until=24h' 2>/dev/null || true && \
              cd /opt/ninjadeals/services && \
-             sudo docker compose -f services.yml pull --quiet $SERVICES && \
-             sudo docker compose -f services.yml up -d $SERVICES"
+             sudo docker compose -f services.yml pull --quiet $DEPLOY_SERVICES && \
+             sudo docker compose -f services.yml up -d $DEPLOY_SERVICES"
           echo "All services deployed."
 
       - name: Close Tunnel
