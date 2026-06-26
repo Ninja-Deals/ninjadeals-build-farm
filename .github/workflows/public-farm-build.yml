@@ -101,6 +101,17 @@ jobs:
       - name: Build and Push ${{ matrix.service }} (ARM64)
         run: |
           IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:latest"
+          # Push image layers compressed with zstd instead of the default gzip.
+          # The apps-VM deploy is unpack-bound, not network-bound (link does 67-207
+          # MB/s but a single image unpacks at ~8.6 MB/s) — the cost is layer
+          # DECOMPRESSION (single-threaded gzip) + extract. zstd decompresses several
+          # times faster and is multi-threaded, so `docker compose pull` on the VM is
+          # faster; the big images (ranking 585 MB, frontend 341 MB) dominate a full
+          # rebuild and benefit most. force-compression re-encodes CACHED layers too
+          # (e.g. ranking's large, rarely-rebuilt site-packages layer) so they don't
+          # stay gzip on a cache hit. VM has docker 29.5 / containerd 2.2 → full zstd
+          # pull support. Replaces the `--push` shorthand (`type=image,push=true`).
+          ZSTD_PUSH="--output type=image,push=true,compression=zstd,compression-level=3,force-compression=true"
           if [ "${{ matrix.service }}" = "frontend" ]; then
             docker buildx build --platform linux/arm64 \
               --build-arg NEXT_PUBLIC_CAPTCHA_ENABLED=false \
@@ -108,17 +119,17 @@ jobs:
               --cache-from=type=gha,scope=frontend \
               --cache-to=type=gha,mode=max,scope=frontend \
               --build-arg NEXT_PUBLIC_VAPID_PUBLIC_KEY="${{ secrets.NEXT_PUBLIC_VAPID_PUBLIC_KEY }}" \
-              --push -f frontend/Dockerfile -t $IMAGE frontend/
+              $ZSTD_PUSH -f frontend/Dockerfile -t $IMAGE frontend/
           elif [ "${{ matrix.service }}" = "ranking" ]; then
             docker buildx build --platform linux/arm64 \
               --cache-from=type=gha,scope=ranking \
               --cache-to=type=gha,mode=max,scope=ranking \
-              --push -f services/ranking/Dockerfile -t $IMAGE services/ranking/
+              $ZSTD_PUSH -f services/ranking/Dockerfile -t $IMAGE services/ranking/
           else
             docker buildx build --platform linux/arm64 \
               --cache-from=type=gha,scope=${{ matrix.service }} \
               --cache-to=type=gha,mode=max,scope=${{ matrix.service }} \
-              --push -f services/${{ matrix.service }}/Dockerfile -t $IMAGE .
+              $ZSTD_PUSH -f services/${{ matrix.service }}/Dockerfile -t $IMAGE .
           fi
 
   # ── DEPLOY ───────────────────────────────────────────────────────────────────
