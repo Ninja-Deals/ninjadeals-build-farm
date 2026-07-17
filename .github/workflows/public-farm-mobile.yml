@@ -152,8 +152,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${EXPO_TOKEN:-}" ]; then
-            echo "::error title=Missing EXPO_TOKEN::Set EXPO_TOKEN in the build-farm repository secrets so EAS can authenticate non-interactively."
-            exit 1
+            if [ "$PLATFORM" = "ios" ]; then
+              echo "::error title=Missing EXPO_TOKEN::Set EXPO_TOKEN in the build-farm repository secrets so EAS can authenticate non-interactively."
+              exit 1
+            fi
+            echo "::notice title=Android fallback build::EXPO_TOKEN is missing; building a debug-signed Android release APK with Expo prebuild + Gradle."
           fi
           if [ "$PLATFORM" = "ios" ]; then
             echo "iOS device-installable IPA builds require Apple signing credentials configured in EAS for the selected profile."
@@ -184,6 +187,10 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Setup Android SDK
+        if: matrix.platform == 'android'
+        uses: android-actions/setup-android@v3
+
       - name: Show Xcode version
         if: matrix.platform == 'ios'
         run: xcodebuild -version
@@ -197,9 +204,11 @@ jobs:
         run: npm run typecheck
 
       - name: Install EAS CLI
+        if: env.EXPO_TOKEN != ''
         run: npm install -g eas-cli@latest
 
-      - name: Build ${{ matrix.platform }} artifact
+      - name: Build ${{ matrix.platform }} artifact with EAS
+        if: env.EXPO_TOKEN != ''
         working-directory: ${{ env.MOBILE_DIR }}
         env:
           EAS_LOCAL_BUILD_SKIP_CLEANUP: '1'
@@ -211,6 +220,19 @@ jobs:
             --platform "$PLATFORM" \
             --profile "$PROFILE" \
             --output "${{ steps.artifact.outputs.output }}"
+
+      - name: Build Android fallback APK without EAS token
+        if: matrix.platform == 'android' && env.EXPO_TOKEN == ''
+        working-directory: ${{ env.MOBILE_DIR }}
+        env:
+          EXPO_PUBLIC_API_BASE: https://staging.ninja.deals
+          EXPO_PUBLIC_WEB_BASE: https://staging.ninja.deals
+          CI: '1'
+        run: |
+          set -euo pipefail
+          npx expo prebuild --platform android
+          ./android/gradlew -p android assembleRelease
+          cp android/app/build/outputs/apk/release/app-release.apk "${{ steps.artifact.outputs.output }}"
 
       - name: Verify mobile binary artifact
         run: |
@@ -230,9 +252,20 @@ jobs:
           CHECKED_SHA="${CHECKED_SHA:-${{ needs.resolve.outputs.sha }}}"
           FAILURE_REASON=""
           if [ -z "${EXPO_TOKEN:-}" ]; then
-            FAILURE_REASON="missing_expo_token"
+            if [ "$PLATFORM" = "ios" ]; then
+              FAILURE_REASON="missing_expo_token"
+            elif [ "$STATUS" != "success" ]; then
+              FAILURE_REASON="android_fallback_failed"
+            fi
           elif [ "$STATUS" != "success" ] && [ ! -s "$ARTIFACT_PATH" ]; then
             FAILURE_REASON="missing_mobile_artifact"
+          fi
+          if [ -n "${EXPO_TOKEN:-}" ]; then
+            BUILD_MODE="eas_local"
+          elif [ "$PLATFORM" = "android" ]; then
+            BUILD_MODE="android_gradle_release_debug_signed"
+          else
+            BUILD_MODE="unavailable"
           fi
           python3 - <<PY
           import json
@@ -240,6 +273,7 @@ jobs:
               "status": "${STATUS}",
               "platform": "${PLATFORM}",
               "profile": "${PROFILE}",
+              "build_mode": "${BUILD_MODE}",
               "monorepo": "${MONOREPO}",
               "ref": "${{ needs.resolve.outputs.ref }}",
               "sha": "${CHECKED_SHA}",
@@ -282,7 +316,9 @@ jobs:
             echo "| SHA | ${CHECKED_SHA} |"
             echo "| Artifact | ninjadeals-${PLATFORM}-${PROFILE}-${GITHUB_RUN_NUMBER} |"
             echo ""
-            if [ "$PLATFORM" = "android" ]; then
+            if [ "$PLATFORM" = "android" ] && [ -z "${EXPO_TOKEN:-}" ]; then
+              echo "Install: download the APK artifact from this run and sideload it on an Android test device. This fallback APK is a debug-signed release build for QA, not a Play/store-signed build."
+            elif [ "$PLATFORM" = "android" ]; then
               echo "Install: download the APK artifact from this run and sideload it on an Android test device."
             else
               echo "Install: download the IPA artifact from this run and install it on a device included in the EAS/Apple provisioning profile."
