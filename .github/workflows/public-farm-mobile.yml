@@ -236,7 +236,7 @@ jobs:
 
       - name: Install mobile dependencies
         working-directory: ${{ env.MOBILE_DIR }}
-        run: npm ci --prefer-offline --no-audit --loglevel=error
+        run: npm ci --prefer-offline --no-audit
 
       - name: Validate mobile TypeScript
         working-directory: ${{ env.MOBILE_DIR }}
@@ -295,8 +295,6 @@ jobs:
           set_gradle_prop org.gradle.parallel true
           set_gradle_prop org.gradle.workers.max 4
           set_gradle_prop org.gradle.jvmargs "-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8"
-          set_gradle_prop org.gradle.daemon.performance.disable-logging true
-          set_gradle_prop kotlin.compiler.suppressWarnings true
 
       - name: Save generated Android project
         if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production' && steps.android-native-cache.outputs.cache-hit != 'true'
@@ -311,7 +309,7 @@ jobs:
         working-directory: ${{ env.MOBILE_DIR }}
         run: |
           set -euo pipefail
-          ./android/gradlew -p android assembleRelease --no-daemon --quiet --console=plain --stacktrace --build-cache --parallel --max-workers=4 --warning-mode=none
+          ./android/gradlew -p android assembleRelease --no-daemon --console=plain --stacktrace --build-cache --parallel --max-workers=4
           cp android/app/build/outputs/apk/release/app-release.apk "${{ steps.artifact.outputs.output }}"
 
       - name: Verify mobile binary artifact
