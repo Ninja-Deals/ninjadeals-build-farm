@@ -214,6 +214,7 @@ jobs:
         uses: android-actions/setup-android@v4
         with:
           log-accepted-android-sdk-licenses: false
+          packages: tools platform-tools ndk;27.1.12297006 cmake;3.22.1
 
       - name: Restore generated Android project
         if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
@@ -274,6 +275,7 @@ jobs:
           else
             npx expo prebuild --platform android --no-install
           fi
+          sed -i '/^newArchEnabled=/d' android/gradle.properties
           if [ -z "${ANDROID_HOME:-}" ]; then
             printf '%s\n' "Missing Android SDK. ANDROID_HOME is not set after setup-android." >&2
             exit 1
