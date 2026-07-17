@@ -31,7 +31,6 @@ on:
 env:
   MONOREPO: Ninja-Deals/ninjadeals-main
   MOBILE_DIR: mobile
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
   # Resume iOS after a paid Apple Developer account exists and EAS has reusable
   # iOS signing credentials for the selected profile. Android remains active.
   IOS_BUILDS_PAUSED: 'true'
@@ -169,11 +168,11 @@ jobs:
           set -euo pipefail
           if [ -z "${EXPO_TOKEN:-}" ]; then
             if [ "$PLATFORM" = "ios" ]; then
-              echo "::error title=Missing EXPO_TOKEN::Set EXPO_TOKEN in the build-farm repository secrets so EAS can authenticate non-interactively."
+              printf '%s\n' "Missing EXPO_TOKEN. Set EXPO_TOKEN in the build-farm repository secrets so EAS can authenticate non-interactively." >&2
               exit 1
             fi
             if [ "$PLATFORM" = "android" ] && [ "$PROFILE" = "production" ]; then
-              echo "::error title=Missing EXPO_TOKEN::Android production builds require EAS credentials/signing; set EXPO_TOKEN."
+              printf '%s\n' "Missing EXPO_TOKEN. Android production builds require EAS credentials/signing; set EXPO_TOKEN." >&2
               exit 1
             fi
             echo "::notice title=Android fallback build::EXPO_TOKEN is missing; building a debug-signed Android release APK with Expo prebuild + Gradle."
@@ -197,7 +196,7 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
@@ -205,34 +204,31 @@ jobs:
 
       - name: Setup Java for Android
         if: matrix.platform == 'android'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Setup Android SDK
         if: matrix.platform == 'android'
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
 
       - name: Restore generated Android project
         if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
         id: android-native-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.MOBILE_DIR }}/android
           key: ${{ runner.os }}-expo-android-native-${{ hashFiles(format('{0}/package-lock.json', env.MOBILE_DIR), format('{0}/app.json', env.MOBILE_DIR), format('{0}/eas.json', env.MOBILE_DIR)) }}
 
-      - name: Cache Gradle
+      - name: Setup Gradle
         if: matrix.platform == 'android'
-        uses: actions/cache@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            ${{ env.MOBILE_DIR }}/android/.gradle
-          key: ${{ runner.os }}-gradle-${{ hashFiles(format('{0}/package-lock.json', env.MOBILE_DIR), format('{0}/app.json', env.MOBILE_DIR), format('{0}/eas.json', env.MOBILE_DIR)) }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
+          cache-provider: basic
+          add-job-summary: on-failure
 
       - name: Show Xcode version
         if: matrix.platform == 'ios'
@@ -240,7 +236,7 @@ jobs:
 
       - name: Install mobile dependencies
         working-directory: ${{ env.MOBILE_DIR }}
-        run: npm ci
+        run: npm ci --prefer-offline --no-audit --loglevel=error
 
       - name: Validate mobile TypeScript
         working-directory: ${{ env.MOBILE_DIR }}
@@ -279,7 +275,7 @@ jobs:
             npx expo prebuild --platform android --no-install
           fi
           if [ -z "${ANDROID_HOME:-}" ]; then
-            echo "::error title=Missing Android SDK::ANDROID_HOME is not set after setup-android."
+            printf '%s\n' "Missing Android SDK. ANDROID_HOME is not set after setup-android." >&2
             exit 1
           fi
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
@@ -293,18 +289,18 @@ jobs:
             fi
           }
           # Preview APKs are for physical Android QA. Keep production on EAS.
-          # Disabling New Architecture and limiting ABI avoids expensive NDK work.
-          set_gradle_prop newArchEnabled false
+          # Limit ABI for faster QA APKs; keep React Native's default architecture.
           set_gradle_prop reactNativeArchitectures arm64-v8a
-          {
-            echo "org.gradle.caching=true"
-            echo "org.gradle.parallel=true"
-            echo "org.gradle.workers.max=4"
-          } >> android/gradle.properties
+          set_gradle_prop org.gradle.caching true
+          set_gradle_prop org.gradle.parallel true
+          set_gradle_prop org.gradle.workers.max 4
+          set_gradle_prop org.gradle.jvmargs "-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8"
+          set_gradle_prop org.gradle.daemon.performance.disable-logging true
+          set_gradle_prop kotlin.compiler.suppressWarnings true
 
       - name: Save generated Android project
         if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production' && steps.android-native-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.MOBILE_DIR }}/android
           key: ${{ steps.android-native-cache.outputs.cache-primary-key }}
@@ -315,14 +311,14 @@ jobs:
         working-directory: ${{ env.MOBILE_DIR }}
         run: |
           set -euo pipefail
-          ./android/gradlew -p android assembleRelease --no-daemon --console=plain --stacktrace --build-cache --parallel --max-workers=4
+          ./android/gradlew -p android assembleRelease --no-daemon --quiet --console=plain --stacktrace --build-cache --parallel --max-workers=4 --warning-mode=none
           cp android/app/build/outputs/apk/release/app-release.apk "${{ steps.artifact.outputs.output }}"
 
       - name: Verify mobile binary artifact
         run: |
           set -euo pipefail
           if [ ! -s "${{ steps.artifact.outputs.output }}" ]; then
-            echo "::error title=Missing mobile artifact::EAS completed but did not create ${{ steps.artifact.outputs.output }}"
+            printf '%s\n' "Missing mobile artifact. Build completed but did not create ${{ steps.artifact.outputs.output }}" >&2
             exit 1
           fi
 
@@ -374,7 +370,7 @@ jobs:
 
       - name: Upload mobile artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ninjadeals-${{ matrix.platform }}-${{ needs.resolve.outputs.profile }}-${{ github.run_number }}
           path: |
