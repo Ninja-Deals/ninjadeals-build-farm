@@ -1,4 +1,5 @@
-name: Public Farm Mobile Build (macOS)
+name: Public Farm Mobile Build
+run-name: Mobile build ${{ github.event.client_payload.platforms || inputs.platforms || 'android' }} ${{ github.event.client_payload.profile || inputs.profile || 'preview' }} from ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
 
 on:
   repository_dispatch:
