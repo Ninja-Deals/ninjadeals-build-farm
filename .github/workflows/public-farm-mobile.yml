@@ -283,6 +283,19 @@ jobs:
             exit 1
           fi
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
+          set_gradle_prop() {
+            local key="$1"
+            local value="$2"
+            if grep -q "^${key}=" android/gradle.properties; then
+              sed -i "s|^${key}=.*|${key}=${value}|" android/gradle.properties
+            else
+              echo "${key}=${value}" >> android/gradle.properties
+            fi
+          }
+          # Preview APKs are for physical Android QA. Keep production on EAS.
+          # Disabling New Architecture and limiting ABI avoids expensive NDK work.
+          set_gradle_prop newArchEnabled false
+          set_gradle_prop reactNativeArchitectures arm64-v8a
           {
             echo "org.gradle.caching=true"
             echo "org.gradle.parallel=true"
