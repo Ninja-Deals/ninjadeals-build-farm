@@ -31,6 +31,9 @@ env:
   MONOREPO: Ninja-Deals/ninjadeals-main
   MOBILE_DIR: mobile
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  # Resume iOS after a paid Apple Developer account exists and EAS has reusable
+  # iOS signing credentials for the selected profile. Android remains active.
+  IOS_BUILDS_PAUSED: 'true'
 
 jobs:
   resolve:
@@ -41,6 +44,8 @@ jobs:
       profile: ${{ steps.inputs.outputs.profile }}
       matrix: ${{ steps.inputs.outputs.matrix }}
       platforms: ${{ steps.inputs.outputs.platforms }}
+      requested_platforms: ${{ steps.inputs.outputs.requested_platforms }}
+      ios_paused: ${{ steps.inputs.outputs.ios_paused }}
       issue: ${{ steps.inputs.outputs.issue }}
     steps:
       - name: Resolve build inputs
@@ -55,6 +60,7 @@ jobs:
           PLATFORMS_PAYLOAD: ${{ toJson(github.event.client_payload.platforms) }}
           ISSUE_INPUT: ${{ inputs.issue }}
           ISSUE_PAYLOAD: ${{ github.event.client_payload.issue }}
+          IOS_BUILDS_PAUSED: ${{ env.IOS_BUILDS_PAUSED }}
         run: |
           python3 <<'PY'
           import json
@@ -96,27 +102,34 @@ jobs:
                       platforms.append(part)
 
           if not platforms or "all" in platforms:
-              platforms = ["android", "ios"]
+              requested_platforms = ["android", "ios"]
+          else:
+              requested_platforms = [p for p in ["android", "ios"] if p in platforms]
 
-          allowed = {"android", "ios"}
+          allowed = {"all", "android", "ios"}
           invalid = sorted(set(platforms) - allowed)
           if invalid:
               raise SystemExit(f"Invalid platform(s): {', '.join(invalid)}")
 
-          platforms = [p for p in ["android", "ios"] if p in platforms]
-          matrix = {"platform": platforms}
+          ios_paused = os.getenv("IOS_BUILDS_PAUSED", "").lower() == "true" and "ios" in requested_platforms
+          platforms = [p for p in requested_platforms if not (p == "ios" and ios_paused)]
+          # A skipped build job still needs a syntactically valid matrix value.
+          matrix = {"platform": platforms or ["android"]}
           out = os.environ["GITHUB_OUTPUT"]
           with open(out, "a", encoding="utf-8") as fh:
               fh.write(f"ref={ref}\n")
               fh.write(f"sha={sha}\n")
               fh.write(f"profile={profile}\n")
               fh.write(f"platforms={','.join(platforms)}\n")
+              fh.write(f"requested_platforms={','.join(requested_platforms)}\n")
+              fh.write(f"ios_paused={'true' if ios_paused else 'false'}\n")
               fh.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
               fh.write(f"issue={issue}\n")
           PY
 
   build:
     needs: resolve
+    if: needs.resolve.outputs.platforms != ''
     runs-on: macos-15
     strategy:
       fail-fast: false
@@ -342,6 +355,8 @@ jobs:
           BUILD_RESULT: ${{ needs.build.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           PLATFORMS: ${{ needs.resolve.outputs.platforms }}
+          REQUESTED_PLATFORMS: ${{ needs.resolve.outputs.requested_platforms }}
+          IOS_PAUSED: ${{ needs.resolve.outputs.ios_paused }}
           PROFILE: ${{ needs.resolve.outputs.profile }}
           REF: ${{ needs.resolve.outputs.ref }}
           SHA: ${{ needs.resolve.outputs.sha }}
@@ -357,7 +372,8 @@ jobs:
 
           | Field | Value |
           |---|---|
-          | Platforms | ${PLATFORMS} |
+          | Requested platforms | ${REQUESTED_PLATFORMS} |
+          | Built platforms | ${PLATFORMS:-none} |
           | Profile | ${PROFILE} |
           | Ref | ${REF} |
           | SHA | ${SHA} |
@@ -365,4 +381,9 @@ jobs:
           Artifacts and install details: ${RUN_URL}
           BODY
           )"
+          if [ "$IOS_PAUSED" = "true" ]; then
+            BODY="${BODY}
+
+          iOS is paused until a paid Apple Developer account is created and EAS iOS signing credentials are configured. Resume by setting IOS_BUILDS_PAUSED=false after credentials exist."
+          fi
           gh api "repos/${REPO}/issues/${ISSUE}/comments" -X POST -f "body=${BODY}" >/dev/null
