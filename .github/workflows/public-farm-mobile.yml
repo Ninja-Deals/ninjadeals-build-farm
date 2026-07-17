@@ -278,6 +278,11 @@ jobs:
           else
             npx expo prebuild --platform android --no-install
           fi
+          if [ -z "${ANDROID_HOME:-}" ]; then
+            echo "::error title=Missing Android SDK::ANDROID_HOME is not set after setup-android."
+            exit 1
+          fi
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
           {
             echo "org.gradle.caching=true"
             echo "org.gradle.parallel=true"
