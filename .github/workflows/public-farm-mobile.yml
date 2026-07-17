@@ -148,6 +148,17 @@ jobs:
           echo "output=$OUT" >> "$GITHUB_OUTPUT"
           echo "details=$DETAILS" >> "$GITHUB_OUTPUT"
 
+      - name: Preflight credentials
+        run: |
+          set -euo pipefail
+          if [ -z "${EXPO_TOKEN:-}" ]; then
+            echo "::error title=Missing EXPO_TOKEN::Set EXPO_TOKEN in the build-farm repository secrets so EAS can authenticate non-interactively."
+            exit 1
+          fi
+          if [ "$PLATFORM" = "ios" ]; then
+            echo "iOS device-installable IPA builds require Apple signing credentials configured in EAS for the selected profile."
+          fi
+
       - name: Checkout Private Monorepo
         uses: actions/checkout@v6
         with:
@@ -188,17 +199,6 @@ jobs:
       - name: Install EAS CLI
         run: npm install -g eas-cli@latest
 
-      - name: Preflight credentials
-        run: |
-          set -euo pipefail
-          if [ -z "${EXPO_TOKEN:-}" ]; then
-            echo "::error title=Missing EXPO_TOKEN::Set EXPO_TOKEN in the build-farm repository secrets so EAS can authenticate non-interactively."
-            exit 1
-          fi
-          if [ "$PLATFORM" = "ios" ]; then
-            echo "iOS device-installable IPA builds require Apple signing credentials configured in EAS for the selected profile."
-          fi
-
       - name: Build ${{ matrix.platform }} artifact
         working-directory: ${{ env.MOBILE_DIR }}
         env:
@@ -212,6 +212,14 @@ jobs:
             --profile "$PROFILE" \
             --output "${{ steps.artifact.outputs.output }}"
 
+      - name: Verify mobile binary artifact
+        run: |
+          set -euo pipefail
+          if [ ! -s "${{ steps.artifact.outputs.output }}" ]; then
+            echo "::error title=Missing mobile artifact::EAS completed but did not create ${{ steps.artifact.outputs.output }}"
+            exit 1
+          fi
+
       - name: Write build details
         if: always()
         run: |
@@ -220,18 +228,31 @@ jobs:
           ARTIFACT_PATH="${{ steps.artifact.outputs.output }}"
           CHECKED_SHA="${{ steps.source.outputs.sha }}"
           CHECKED_SHA="${CHECKED_SHA:-${{ needs.resolve.outputs.sha }}}"
-          cat > "${{ steps.artifact.outputs.details }}" <<JSON
-          {
-            "status": "${STATUS}",
-            "platform": "${PLATFORM}",
-            "profile": "${PROFILE}",
-            "monorepo": "${MONOREPO}",
-            "ref": "${{ needs.resolve.outputs.ref }}",
-            "sha": "${CHECKED_SHA}",
-            "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-            "artifact_file": "$(basename "$ARTIFACT_PATH")"
+          FAILURE_REASON=""
+          if [ -z "${EXPO_TOKEN:-}" ]; then
+            FAILURE_REASON="missing_expo_token"
+          elif [ "$STATUS" != "success" ] && [ ! -s "$ARTIFACT_PATH" ]; then
+            FAILURE_REASON="missing_mobile_artifact"
+          fi
+          python3 - <<PY
+          import json
+          data = {
+              "status": "${STATUS}",
+              "platform": "${PLATFORM}",
+              "profile": "${PROFILE}",
+              "monorepo": "${MONOREPO}",
+              "ref": "${{ needs.resolve.outputs.ref }}",
+              "sha": "${CHECKED_SHA}",
+              "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "artifact_file": "$(basename "$ARTIFACT_PATH")",
           }
-          JSON
+          failure_reason = "${FAILURE_REASON}"
+          if failure_reason:
+              data["failure_reason"] = failure_reason
+          with open("${{ steps.artifact.outputs.details }}", "w", encoding="utf-8") as fh:
+              json.dump(data, fh, indent=2)
+              fh.write("\\n")
+          PY
 
       - name: Upload mobile artifact
         if: always()
