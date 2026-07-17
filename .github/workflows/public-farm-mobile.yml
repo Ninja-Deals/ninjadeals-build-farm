@@ -291,12 +291,17 @@ jobs:
           set_gradle_prop org.gradle.workers.max 4
           set_gradle_prop org.gradle.jvmargs "-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8"
 
-      - name: Setup Gradle
+      - name: Cache Gradle
         if: matrix.platform == 'android'
-        uses: gradle/actions/setup-gradle@v6
+        uses: actions/cache@v6
         with:
-          cache-provider: basic
-          add-job-summary: on-failure
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ${{ env.MOBILE_DIR }}/android/.gradle
+          key: ${{ runner.os }}-gradle-${{ hashFiles(format('{0}/package-lock.json', env.MOBILE_DIR), format('{0}/app.json', env.MOBILE_DIR), format('{0}/eas.json', env.MOBILE_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
 
       - name: Save generated Android project
         if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production' && steps.android-native-cache.outputs.cache-hit != 'true'
