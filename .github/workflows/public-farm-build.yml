@@ -3,6 +3,8 @@ name: Public Farm Build (ARM64)
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '.github/workflows/**'
   workflow_dispatch:
     inputs:
       services:
