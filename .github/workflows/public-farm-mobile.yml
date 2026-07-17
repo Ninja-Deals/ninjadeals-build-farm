@@ -223,6 +223,7 @@ jobs:
 
       - name: Build Android fallback APK without EAS token
         if: matrix.platform == 'android' && env.EXPO_TOKEN == ''
+        timeout-minutes: 25
         working-directory: ${{ env.MOBILE_DIR }}
         env:
           EXPO_PUBLIC_API_BASE: https://staging.ninja.deals
@@ -231,7 +232,7 @@ jobs:
         run: |
           set -euo pipefail
           npx expo prebuild --platform android
-          ./android/gradlew -p android assembleRelease
+          ./android/gradlew -p android assembleRelease --no-daemon --console=plain --stacktrace
           cp android/app/build/outputs/apk/release/app-release.apk "${{ steps.artifact.outputs.output }}"
 
       - name: Verify mobile binary artifact
