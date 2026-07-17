@@ -214,6 +214,14 @@ jobs:
         if: matrix.platform == 'android'
         uses: android-actions/setup-android@v3
 
+      - name: Restore generated Android project
+        if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
+        id: android-native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.MOBILE_DIR }}/android
+          key: ${{ runner.os }}-expo-android-native-${{ hashFiles(format('{0}/package-lock.json', env.MOBILE_DIR), format('{0}/app.json', env.MOBILE_DIR), format('{0}/eas.json', env.MOBILE_DIR)) }}
+
       - name: Cache Gradle
         if: matrix.platform == 'android'
         uses: actions/cache@v4
@@ -256,17 +264,40 @@ jobs:
             --profile "$PROFILE" \
             --output "${{ steps.artifact.outputs.output }}"
 
-      - name: Build Android preview APK with Gradle
+      - name: Prepare Android native project
         if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
-        timeout-minutes: 25
+        timeout-minutes: 8
         working-directory: ${{ env.MOBILE_DIR }}
         env:
           EXPO_PUBLIC_API_BASE: https://staging.ninja.deals
           EXPO_PUBLIC_WEB_BASE: https://staging.ninja.deals
         run: |
           set -euo pipefail
-          npx expo prebuild --platform android --no-install
-          ./android/gradlew -p android assembleRelease --no-daemon --console=plain --stacktrace --build-cache
+          if [ -d android ]; then
+            npx expo prebuild --platform android --no-install --no-clean
+          else
+            npx expo prebuild --platform android --no-install
+          fi
+          {
+            echo "org.gradle.caching=true"
+            echo "org.gradle.parallel=true"
+            echo "org.gradle.workers.max=4"
+          } >> android/gradle.properties
+
+      - name: Save generated Android project
+        if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production' && steps.android-native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.MOBILE_DIR }}/android
+          key: ${{ steps.android-native-cache.outputs.cache-primary-key }}
+
+      - name: Build Android preview APK with Gradle
+        if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
+        timeout-minutes: 20
+        working-directory: ${{ env.MOBILE_DIR }}
+        run: |
+          set -euo pipefail
+          ./android/gradlew -p android assembleRelease --no-daemon --console=plain --stacktrace --build-cache --parallel --max-workers=4
           cp android/app/build/outputs/apk/release/app-release.apk "${{ steps.artifact.outputs.output }}"
 
       - name: Verify mobile binary artifact
