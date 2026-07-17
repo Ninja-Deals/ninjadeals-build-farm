@@ -1,0 +1,310 @@
+name: Public Farm Mobile Build (macOS)
+
+on:
+  repository_dispatch:
+    types: [trigger-mobile-build]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'ninjadeals-main ref to build'
+        required: false
+        default: 'main'
+      platforms:
+        description: 'Platforms to build'
+        required: true
+        type: choice
+        default: 'all'
+        options:
+          - all
+          - android
+          - ios
+      profile:
+        description: 'EAS build profile'
+        required: true
+        default: 'preview'
+      issue:
+        description: 'Optional ninjadeals-main issue number to comment with results'
+        required: false
+        default: ''
+
+env:
+  MONOREPO: Ninja-Deals/ninjadeals-main
+  MOBILE_DIR: mobile
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.inputs.outputs.ref }}
+      sha: ${{ steps.inputs.outputs.sha }}
+      profile: ${{ steps.inputs.outputs.profile }}
+      matrix: ${{ steps.inputs.outputs.matrix }}
+      platforms: ${{ steps.inputs.outputs.platforms }}
+      issue: ${{ steps.inputs.outputs.issue }}
+    steps:
+      - name: Resolve build inputs
+        id: inputs
+        env:
+          REF_INPUT: ${{ inputs.ref }}
+          REF_PAYLOAD: ${{ github.event.client_payload.ref }}
+          SHA_PAYLOAD: ${{ github.event.client_payload.sha }}
+          PROFILE_INPUT: ${{ inputs.profile }}
+          PROFILE_PAYLOAD: ${{ github.event.client_payload.profile }}
+          PLATFORMS_INPUT: ${{ inputs.platforms }}
+          PLATFORMS_PAYLOAD: ${{ toJson(github.event.client_payload.platforms) }}
+          ISSUE_INPUT: ${{ inputs.issue }}
+          ISSUE_PAYLOAD: ${{ github.event.client_payload.issue }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+
+          def first(*values, default=""):
+              for value in values:
+                  if value is None:
+                      continue
+                  value = str(value).strip()
+                  if value and value not in {"null", '""'}:
+                      return value
+              return default
+
+          ref = first(os.getenv("REF_PAYLOAD"), os.getenv("REF_INPUT"), default="main")
+          sha = first(os.getenv("SHA_PAYLOAD"), default="")
+          profile = first(os.getenv("PROFILE_PAYLOAD"), os.getenv("PROFILE_INPUT"), default="preview")
+          issue = first(os.getenv("ISSUE_PAYLOAD"), os.getenv("ISSUE_INPUT"), default="")
+
+          payload = os.getenv("PLATFORMS_PAYLOAD", "null")
+          try:
+              parsed = json.loads(payload)
+          except Exception:
+              parsed = None
+
+          raw_platforms = []
+          if isinstance(parsed, list):
+              raw_platforms = parsed
+          elif isinstance(parsed, str) and parsed.strip():
+              raw_platforms = [parsed]
+          else:
+              raw_platforms = [first(os.getenv("PLATFORMS_INPUT"), default="all")]
+
+          platforms = []
+          for item in raw_platforms:
+              for part in str(item).split(","):
+                  part = part.strip().lower()
+                  if part:
+                      platforms.append(part)
+
+          if not platforms or "all" in platforms:
+              platforms = ["android", "ios"]
+
+          allowed = {"android", "ios"}
+          invalid = sorted(set(platforms) - allowed)
+          if invalid:
+              raise SystemExit(f"Invalid platform(s): {', '.join(invalid)}")
+
+          platforms = [p for p in ["android", "ios"] if p in platforms]
+          matrix = {"platform": platforms}
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as fh:
+              fh.write(f"ref={ref}\n")
+              fh.write(f"sha={sha}\n")
+              fh.write(f"profile={profile}\n")
+              fh.write(f"platforms={','.join(platforms)}\n")
+              fh.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
+              fh.write(f"issue={issue}\n")
+          PY
+
+  build:
+    needs: resolve
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    concurrency:
+      group: mobile-${{ needs.resolve.outputs.ref }}-${{ matrix.platform }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      PROFILE: ${{ needs.resolve.outputs.profile }}
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+    steps:
+      - name: Prepare artifact paths
+        id: artifact
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mobile-artifacts"
+          if [ "$PLATFORM" = "android" ] && [ "$PROFILE" = "production" ]; then
+            EXT="aab"
+          elif [ "$PLATFORM" = "android" ]; then
+            EXT="apk"
+          else
+            EXT="ipa"
+          fi
+          OUT="$RUNNER_TEMP/mobile-artifacts/ninjadeals-${PLATFORM}-${PROFILE}-${GITHUB_RUN_NUMBER}.${EXT}"
+          DETAILS="$RUNNER_TEMP/mobile-artifacts/ninjadeals-${PLATFORM}-${PROFILE}-${GITHUB_RUN_NUMBER}.json"
+          echo "output=$OUT" >> "$GITHUB_OUTPUT"
+          echo "details=$DETAILS" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Private Monorepo
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.MONOREPO }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
+      - name: Resolve checkout SHA
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ${{ env.MOBILE_DIR }}/package-lock.json
+
+      - name: Setup Java for Android
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Show Xcode version
+        if: matrix.platform == 'ios'
+        run: xcodebuild -version
+
+      - name: Install mobile dependencies
+        working-directory: ${{ env.MOBILE_DIR }}
+        run: npm ci
+
+      - name: Validate mobile TypeScript
+        working-directory: ${{ env.MOBILE_DIR }}
+        run: npm run typecheck
+
+      - name: Install EAS CLI
+        run: npm install -g eas-cli@latest
+
+      - name: Preflight credentials
+        run: |
+          set -euo pipefail
+          if [ -z "${EXPO_TOKEN:-}" ]; then
+            echo "::error title=Missing EXPO_TOKEN::Set EXPO_TOKEN in the build-farm repository secrets so EAS can authenticate non-interactively."
+            exit 1
+          fi
+          if [ "$PLATFORM" = "ios" ]; then
+            echo "iOS device-installable IPA builds require Apple signing credentials configured in EAS for the selected profile."
+          fi
+
+      - name: Build ${{ matrix.platform }} artifact
+        working-directory: ${{ env.MOBILE_DIR }}
+        env:
+          EAS_LOCAL_BUILD_SKIP_CLEANUP: '1'
+        run: |
+          set -euo pipefail
+          eas build \
+            --local \
+            --non-interactive \
+            --platform "$PLATFORM" \
+            --profile "$PROFILE" \
+            --output "${{ steps.artifact.outputs.output }}"
+
+      - name: Write build details
+        if: always()
+        run: |
+          set -euo pipefail
+          STATUS="${{ job.status }}"
+          ARTIFACT_PATH="${{ steps.artifact.outputs.output }}"
+          CHECKED_SHA="${{ steps.source.outputs.sha }}"
+          CHECKED_SHA="${CHECKED_SHA:-${{ needs.resolve.outputs.sha }}}"
+          cat > "${{ steps.artifact.outputs.details }}" <<JSON
+          {
+            "status": "${STATUS}",
+            "platform": "${PLATFORM}",
+            "profile": "${PROFILE}",
+            "monorepo": "${MONOREPO}",
+            "ref": "${{ needs.resolve.outputs.ref }}",
+            "sha": "${CHECKED_SHA}",
+            "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "artifact_file": "$(basename "$ARTIFACT_PATH")"
+          }
+          JSON
+
+      - name: Upload mobile artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ninjadeals-${{ matrix.platform }}-${{ needs.resolve.outputs.profile }}-${{ github.run_number }}
+          path: |
+            ${{ steps.artifact.outputs.output }}
+            ${{ steps.artifact.outputs.details }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Summarize build
+        if: always()
+        run: |
+          CHECKED_SHA="${{ steps.source.outputs.sha }}"
+          CHECKED_SHA="${CHECKED_SHA:-${{ needs.resolve.outputs.sha }}}"
+          {
+            echo "### NinjaDeals mobile ${PLATFORM} build"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Status | ${{ job.status }} |"
+            echo "| Platform | ${PLATFORM} |"
+            echo "| Profile | ${PROFILE} |"
+            echo "| Ref | ${{ needs.resolve.outputs.ref }} |"
+            echo "| SHA | ${CHECKED_SHA} |"
+            echo "| Artifact | ninjadeals-${PLATFORM}-${PROFILE}-${GITHUB_RUN_NUMBER} |"
+            echo ""
+            if [ "$PLATFORM" = "android" ]; then
+              echo "Install: download the APK artifact from this run and sideload it on an Android test device."
+            else
+              echo "Install: download the IPA artifact from this run and install it on a device included in the EAS/Apple provisioning profile."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    needs: [resolve, build]
+    if: always() && needs.resolve.outputs.issue != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Comment mobile build result
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+          REPO: Ninja-Deals/ninjadeals-main
+          ISSUE: ${{ needs.resolve.outputs.issue }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PLATFORMS: ${{ needs.resolve.outputs.platforms }}
+          PROFILE: ${{ needs.resolve.outputs.profile }}
+          REF: ${{ needs.resolve.outputs.ref }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_RESULT" = "success" ]; then
+            TITLE="Mobile build succeeded"
+          else
+            TITLE="Mobile build failed"
+          fi
+          BODY="$(cat <<BODY
+          ### ${TITLE}
+
+          | Field | Value |
+          |---|---|
+          | Platforms | ${PLATFORMS} |
+          | Profile | ${PROFILE} |
+          | Ref | ${REF} |
+          | SHA | ${SHA} |
+
+          Artifacts and install details: ${RUN_URL}
+          BODY
+          )"
+          gh api "repos/${REPO}/issues/${ISSUE}/comments" -X POST -f "body=${BODY}" >/dev/null
