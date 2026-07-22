@@ -283,9 +283,9 @@ jobs:
               echo "${key}=${value}" >> android/gradle.properties
             fi
           }
-          # Preview APKs are for physical Android QA. Keep production on EAS.
-          # Limit ABI for faster QA APKs; keep React Native's default architecture.
-          set_gradle_prop reactNativeArchitectures arm64-v8a
+          # Preview APKs must work on both physical ARM64 devices and the x86_64
+          # Android emulator used for local QA. Keep production on EAS.
+          set_gradle_prop reactNativeArchitectures arm64-v8a,x86_64
           set_gradle_prop org.gradle.caching true
           set_gradle_prop org.gradle.parallel true
           set_gradle_prop org.gradle.workers.max 4
@@ -365,6 +365,8 @@ jobs:
               "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
               "artifact_file": "$(basename "$ARTIFACT_PATH")",
           }
+          if "${PLATFORM}" == "android" and "${PROFILE}" != "production":
+              data["android_abis"] = ["arm64-v8a", "x86_64"]
           failure_reason = "${FAILURE_REASON}"
           if failure_reason:
               data["failure_reason"] = failure_reason
@@ -402,7 +404,7 @@ jobs:
             echo "| Artifact | ninjadeals-${PLATFORM}-${PROFILE}-${GITHUB_RUN_NUMBER} |"
             echo ""
             if [ "$PLATFORM" = "android" ] && [ "$PROFILE" != "production" ]; then
-              echo "Install: download the APK artifact from this run and sideload it on an Android test device. This is a Gradle-built release APK for QA, not a Play/store-signed production build."
+              echo "Install: download the universal APK artifact from this run and sideload it on an ARM64 device or x86_64 Android emulator. This is a Gradle-built release APK for QA, not a Play/store-signed production build."
             elif [ "$PLATFORM" = "android" ]; then
               echo "Install: download the APK artifact from this run and sideload it on an Android test device."
             else
