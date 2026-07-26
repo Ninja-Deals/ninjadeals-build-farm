@@ -268,7 +268,6 @@ jobs:
           else
             npx expo prebuild --platform android --no-install
           fi
-          sed -i '/^newArchEnabled=/d' android/gradle.properties
           if [ -z "${ANDROID_HOME:-}" ]; then
             printf '%s\n' "Missing Android SDK. ANDROID_HOME is not set after setup-android." >&2
             exit 1
@@ -283,6 +282,9 @@ jobs:
               echo "${key}=${value}" >> android/gradle.properties
             fi
           }
+          # Expo SDK 57 / React Native 0.86 requires New Architecture codegen;
+          # disabling it leaves generated native interfaces missing at compile time.
+          set_gradle_prop newArchEnabled true
           # Preview APKs must work on both physical ARM64 devices and the x86_64
           # Android emulator used for local QA. Keep production on EAS.
           set_gradle_prop reactNativeArchitectures arm64-v8a,x86_64
