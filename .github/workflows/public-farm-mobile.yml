@@ -316,10 +316,20 @@ jobs:
         if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
         timeout-minutes: 20
         working-directory: ${{ env.MOBILE_DIR }}
+        env:
+          # Gradle invokes Metro in this step, so Expo public values must be
+          # present here as well as during the earlier prebuild step.
+          EXPO_PUBLIC_API_BASE: https://staging.ninja.deals
+          EXPO_PUBLIC_WEB_BASE: https://staging.ninja.deals
         run: |
           set -euo pipefail
           ./android/gradlew -p android assembleRelease --no-daemon --console=plain --stacktrace --build-cache --parallel --max-workers=4
           cp android/app/build/outputs/apk/release/app-release.apk "${{ steps.artifact.outputs.output }}"
+          if ! unzip -p "${{ steps.artifact.outputs.output }}" assets/index.android.bundle \
+            | grep -aF "$EXPO_PUBLIC_API_BASE" >/dev/null; then
+            printf '%s\n' "Android preview bundle is missing EXPO_PUBLIC_API_BASE=$EXPO_PUBLIC_API_BASE" >&2
+            exit 1
+          fi
 
       - name: Verify mobile binary artifact
         run: |
