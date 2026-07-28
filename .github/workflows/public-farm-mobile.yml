@@ -42,6 +42,11 @@ jobs:
       ref: ${{ steps.inputs.outputs.ref }}
       sha: ${{ steps.inputs.outputs.sha }}
       profile: ${{ steps.inputs.outputs.profile }}
+      app_kind: ${{ steps.inputs.outputs.app_kind }}
+      app_root: ${{ steps.inputs.outputs.app_root }}
+      gradle_task: ${{ steps.inputs.outputs.gradle_task }}
+      artifact_glob: ${{ steps.inputs.outputs.artifact_glob }}
+      artifact_ext: ${{ steps.inputs.outputs.artifact_ext }}
       matrix: ${{ steps.inputs.outputs.matrix }}
       platforms: ${{ steps.inputs.outputs.platforms }}
       requested_platforms: ${{ steps.inputs.outputs.requested_platforms }}
@@ -58,6 +63,11 @@ jobs:
           PROFILE_PAYLOAD: ${{ github.event.client_payload.profile }}
           PLATFORMS_INPUT: ${{ inputs.platforms }}
           PLATFORMS_PAYLOAD: ${{ toJson(github.event.client_payload.platforms) }}
+          APP_KIND_PAYLOAD: ${{ github.event.client_payload.app_kind }}
+          APP_ROOT_PAYLOAD: ${{ github.event.client_payload.app_root }}
+          GRADLE_TASK_PAYLOAD: ${{ github.event.client_payload.gradle_task }}
+          ARTIFACT_GLOB_PAYLOAD: ${{ github.event.client_payload.artifact_glob }}
+          ARTIFACT_EXT_PAYLOAD: ${{ github.event.client_payload.artifact_ext }}
           ISSUE_INPUT: ${{ inputs.issue }}
           ISSUE_PAYLOAD: ${{ github.event.client_payload.issue }}
           IOS_BUILDS_PAUSED: ${{ env.IOS_BUILDS_PAUSED }}
@@ -79,6 +89,25 @@ jobs:
           sha = first(os.getenv("SHA_PAYLOAD"), default="")
           profile = first(os.getenv("PROFILE_PAYLOAD"), os.getenv("PROFILE_INPUT"), default="preview")
           issue = first(os.getenv("ISSUE_PAYLOAD"), os.getenv("ISSUE_INPUT"), default="")
+          app_kind = first(os.getenv("APP_KIND_PAYLOAD"), default="legacy_expo")
+          app_root = first(os.getenv("APP_ROOT_PAYLOAD"), default="mobile")
+          gradle_task = first(os.getenv("GRADLE_TASK_PAYLOAD"), default="")
+          artifact_glob = first(os.getenv("ARTIFACT_GLOB_PAYLOAD"), default="")
+          artifact_ext = first(os.getenv("ARTIFACT_EXT_PAYLOAD"), default="")
+
+          if app_kind not in {"legacy_expo", "native_android"}:
+              raise SystemExit(f"Invalid app_kind: {app_kind}")
+          if app_kind == "native_android":
+              if app_root != "android":
+                  raise SystemExit("native_android builds must use app_root=android")
+              if not gradle_task:
+                  gradle_task = ":app:assembleInternalDebug"
+              if not artifact_glob:
+                  artifact_glob = "app/build/outputs/apk/internal/debug/app-internal-debug.apk"
+              if not artifact_ext:
+                  artifact_ext = "apk"
+          else:
+              app_root = "mobile"
 
           payload = os.getenv("PLATFORMS_PAYLOAD", "null")
           try:
@@ -120,6 +149,11 @@ jobs:
               fh.write(f"ref={ref}\n")
               fh.write(f"sha={sha}\n")
               fh.write(f"profile={profile}\n")
+              fh.write(f"app_kind={app_kind}\n")
+              fh.write(f"app_root={app_root}\n")
+              fh.write(f"gradle_task={gradle_task}\n")
+              fh.write(f"artifact_glob={artifact_glob}\n")
+              fh.write(f"artifact_ext={artifact_ext}\n")
               fh.write(f"platforms={','.join(platforms)}\n")
               fh.write(f"requested_platforms={','.join(requested_platforms)}\n")
               fh.write(f"ios_paused={'true' if ios_paused else 'false'}\n")
@@ -142,6 +176,10 @@ jobs:
     env:
       PLATFORM: ${{ matrix.platform }}
       PROFILE: ${{ needs.resolve.outputs.profile }}
+      APP_KIND: ${{ needs.resolve.outputs.app_kind }}
+      APP_ROOT: ${{ needs.resolve.outputs.app_root }}
+      GRADLE_TASK: ${{ needs.resolve.outputs.gradle_task }}
+      ARTIFACT_GLOB: ${{ needs.resolve.outputs.artifact_glob }}
       EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
       CI: '1'
       EXPO_NO_TELEMETRY: '1'
@@ -151,7 +189,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/mobile-artifacts"
-          if [ "$PLATFORM" = "android" ] && [ "$PROFILE" = "production" ]; then
+          if [ "${{ needs.resolve.outputs.artifact_ext }}" != "" ]; then
+            EXT="${{ needs.resolve.outputs.artifact_ext }}"
+          elif [ "$PLATFORM" = "android" ] && [ "$PROFILE" = "production" ]; then
             EXT="aab"
           elif [ "$PLATFORM" = "android" ]; then
             EXT="apk"
@@ -166,6 +206,10 @@ jobs:
       - name: Preflight credentials
         run: |
           set -euo pipefail
+          if [ "$APP_KIND" = "native_android" ]; then
+            echo "::notice title=Native Android build::Building clean-room native Android artifact from android/ with Gradle."
+            exit 0
+          fi
           if [ -z "${EXPO_TOKEN:-}" ]; then
             if [ "$PLATFORM" = "ios" ]; then
               printf '%s\n' "Missing EXPO_TOKEN. Set EXPO_TOKEN in the build-farm repository secrets so EAS can authenticate non-interactively." >&2
@@ -200,6 +244,7 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node
+        if: needs.resolve.outputs.app_kind != 'native_android'
         uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -211,7 +256,7 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: ${{ needs.resolve.outputs.app_kind == 'native_android' && '21' || '17' }}
 
       - name: Setup Android SDK
         if: matrix.platform == 'android'
@@ -221,7 +266,7 @@ jobs:
           packages: tools platform-tools ndk;27.1.12297006 cmake;3.22.1
 
       - name: Restore generated Android project
-        if: env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
+        if: needs.resolve.outputs.app_kind != 'native_android' && env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
         id: android-native-cache
         uses: actions/cache/restore@v6
         with:
@@ -233,19 +278,21 @@ jobs:
         run: xcodebuild -version
 
       - name: Install mobile dependencies
+        if: needs.resolve.outputs.app_kind != 'native_android'
         working-directory: ${{ env.MOBILE_DIR }}
         run: npm ci --prefer-offline --no-audit
 
       - name: Validate mobile TypeScript
+        if: needs.resolve.outputs.app_kind != 'native_android'
         working-directory: ${{ env.MOBILE_DIR }}
         run: npm run typecheck
 
       - name: Install EAS CLI
-        if: env.EXPO_TOKEN != ''
+        if: needs.resolve.outputs.app_kind != 'native_android' && env.EXPO_TOKEN != ''
         run: npm install -g eas-cli@latest
 
       - name: Build ${{ matrix.platform }} artifact with EAS
-        if: env.EXPO_TOKEN != ''
+        if: needs.resolve.outputs.app_kind != 'native_android' && env.EXPO_TOKEN != ''
         working-directory: ${{ env.MOBILE_DIR }}
         env:
           EAS_LOCAL_BUILD_SKIP_CLEANUP: '1'
@@ -281,7 +328,7 @@ jobs:
           fi
 
       - name: Prepare Android native project
-        if: env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
+        if: needs.resolve.outputs.app_kind != 'native_android' && env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
         timeout-minutes: 8
         working-directory: ${{ env.MOBILE_DIR }}
         env:
@@ -333,14 +380,14 @@ jobs:
             ${{ runner.os }}-gradle-
 
       - name: Save generated Android project
-        if: env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production' && steps.android-native-cache.outputs.cache-hit != 'true'
+        if: needs.resolve.outputs.app_kind != 'native_android' && env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production' && steps.android-native-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: ${{ env.MOBILE_DIR }}/android
           key: ${{ steps.android-native-cache.outputs.cache-primary-key }}
 
       - name: Build Android preview APK with Gradle
-        if: env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
+        if: needs.resolve.outputs.app_kind != 'native_android' && env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
         timeout-minutes: 20
         working-directory: ${{ env.MOBILE_DIR }}
         env:
@@ -364,6 +411,26 @@ jobs:
             exit 1
           fi
 
+      - name: Build native Android artifact with Gradle
+        if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android'
+        timeout-minutes: 25
+        working-directory: ${{ needs.resolve.outputs.app_root }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANDROID_HOME:-}" ]; then
+            printf '%s\n' "Missing Android SDK. ANDROID_HOME is not set after setup-android." >&2
+            exit 1
+          fi
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          ./gradlew --no-daemon --console=plain --stacktrace --build-cache --parallel "$GRADLE_TASK"
+          cp "$ARTIFACT_GLOB" "${{ steps.artifact.outputs.output }}"
+          if unzip -l "${{ steps.artifact.outputs.output }}" | grep -q 'lib/'; then
+            if ! unzip -l "${{ steps.artifact.outputs.output }}" | grep -q 'lib/arm64-v8a/'; then
+              printf '%s\n' "Native Android artifact contains native libraries but no arm64-v8a directory." >&2
+              exit 1
+            fi
+          fi
+
       - name: Verify mobile binary artifact
         run: |
           set -euo pipefail
@@ -381,7 +448,11 @@ jobs:
           CHECKED_SHA="${{ steps.source.outputs.sha }}"
           CHECKED_SHA="${CHECKED_SHA:-${{ needs.resolve.outputs.sha }}}"
           FAILURE_REASON=""
-          if [ -z "${EXPO_TOKEN:-}" ]; then
+          if [ "$APP_KIND" = "native_android" ]; then
+            if [ "$STATUS" != "success" ]; then
+              FAILURE_REASON="native_android_gradle_failed"
+            fi
+          elif [ -z "${EXPO_TOKEN:-}" ]; then
             if [ "$PLATFORM" = "ios" ]; then
               FAILURE_REASON="missing_expo_token"
             elif [ "$STATUS" != "success" ]; then
@@ -390,7 +461,9 @@ jobs:
           elif [ "$STATUS" != "success" ] && [ ! -s "$ARTIFACT_PATH" ]; then
             FAILURE_REASON="missing_mobile_artifact"
           fi
-          if [ -n "${EXPO_TOKEN:-}" ]; then
+          if [ "$APP_KIND" = "native_android" ]; then
+            BUILD_MODE="native_android_gradle"
+          elif [ -n "${EXPO_TOKEN:-}" ]; then
             BUILD_MODE="eas_local"
           elif [ "$PLATFORM" = "android" ] && [ "$PROFILE" != "production" ]; then
             BUILD_MODE="android_gradle_release_debug_signed"
@@ -403,6 +476,7 @@ jobs:
               "status": "${STATUS}",
               "platform": "${PLATFORM}",
               "profile": "${PROFILE}",
+              "app_kind": "${APP_KIND}",
               "build_mode": "${BUILD_MODE}",
               "monorepo": "${MONOREPO}",
               "ref": "${{ needs.resolve.outputs.ref }}",
@@ -410,7 +484,10 @@ jobs:
               "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
               "artifact_file": "$(basename "$ARTIFACT_PATH")",
           }
-          if "${PLATFORM}" == "android" and "${PROFILE}" != "production":
+          if "${APP_KIND}" == "native_android":
+              data["gradle_task"] = "${GRADLE_TASK}"
+              data["android_abis"] = ["arm64-v8a"]
+          elif "${PLATFORM}" == "android" and "${PROFILE}" != "production":
               data["android_abis"] = ["arm64-v8a", "x86_64"]
           failure_reason = "${FAILURE_REASON}"
           if failure_reason:
@@ -444,11 +521,14 @@ jobs:
             echo "| Status | ${{ job.status }} |"
             echo "| Platform | ${PLATFORM} |"
             echo "| Profile | ${PROFILE} |"
+            echo "| App kind | ${APP_KIND} |"
             echo "| Ref | ${{ needs.resolve.outputs.ref }} |"
             echo "| SHA | ${CHECKED_SHA} |"
             echo "| Artifact | ninjadeals-${PLATFORM}-${PROFILE}-${GITHUB_RUN_NUMBER} |"
             echo ""
-            if [ "$PLATFORM" = "android" ] && [ "$PROFILE" != "production" ]; then
+            if [ "$APP_KIND" = "native_android" ]; then
+              echo "Install: download the native Android APK/AAB artifact from this run. Internal/staging APKs are suitable for ARM64 physical-device QA installs."
+            elif [ "$PLATFORM" = "android" ] && [ "$PROFILE" != "production" ]; then
               echo "Install: download the universal APK artifact from this run and sideload it on an ARM64 device or x86_64 Android emulator. This is a Gradle-built release APK for QA, not a Play/store-signed production build."
             elif [ "$PLATFORM" = "android" ]; then
               echo "Install: download the APK artifact from this run and sideload it on an Android test device."
