@@ -256,7 +256,7 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: ${{ needs.resolve.outputs.app_kind == 'native_android' && '21' || '17' }}
+          java-version: ${{ needs.resolve.outputs.app_kind == 'native_android' && '25' || '17' }}
 
       - name: Setup Android SDK
         if: matrix.platform == 'android'
