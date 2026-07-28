@@ -178,7 +178,11 @@ jobs:
             echo "::notice title=Android fallback build::EXPO_TOKEN is missing; building a debug-signed Android release APK with Expo prebuild + Gradle."
           fi
           if [ "$PLATFORM" = "android" ] && [ "$PROFILE" != "production" ]; then
-            echo "::notice title=Fast Android preview build::Building preview APK directly with Expo prebuild + Gradle instead of EAS local."
+            if [ -n "${EXPO_TOKEN:-}" ]; then
+              echo "::notice title=EAS-signed Android preview build::Building preview APK with EAS local so Google Sign-In uses the configured Android signing fingerprint."
+            else
+              echo "::notice title=Android fallback build::Building preview APK directly with Expo prebuild + Gradle. Google Sign-In requires this debug signing SHA-1 to be registered in Google Cloud."
+            fi
           fi
           if [ "$PLATFORM" = "ios" ]; then
             echo "iOS device-installable IPA builds require Apple signing credentials configured in EAS for the selected profile."
@@ -217,7 +221,7 @@ jobs:
           packages: tools platform-tools ndk;27.1.12297006 cmake;3.22.1
 
       - name: Restore generated Android project
-        if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
+        if: env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
         id: android-native-cache
         uses: actions/cache/restore@v6
         with:
@@ -237,14 +241,17 @@ jobs:
         run: npm run typecheck
 
       - name: Install EAS CLI
-        if: env.EXPO_TOKEN != '' && (matrix.platform != 'android' || needs.resolve.outputs.profile == 'production')
+        if: env.EXPO_TOKEN != ''
         run: npm install -g eas-cli@latest
 
       - name: Build ${{ matrix.platform }} artifact with EAS
-        if: env.EXPO_TOKEN != '' && (matrix.platform != 'android' || needs.resolve.outputs.profile == 'production')
+        if: env.EXPO_TOKEN != ''
         working-directory: ${{ env.MOBILE_DIR }}
         env:
           EAS_LOCAL_BUILD_SKIP_CLEANUP: '1'
+          EXPO_PUBLIC_API_BASE: https://staging.ninja.deals
+          EXPO_PUBLIC_WEB_BASE: https://staging.ninja.deals
+          EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID: 858507870976-ke3dkhrhr1t94uqaoifkbrh8c0m961qq.apps.googleusercontent.com
         run: |
           set -euo pipefail
           eas build \
@@ -253,9 +260,28 @@ jobs:
             --platform "$PLATFORM" \
             --profile "$PROFILE" \
             --output "${{ steps.artifact.outputs.output }}"
+          case "${{ steps.artifact.outputs.output }}" in
+            *.apk)
+              ;;
+            *)
+              exit 0
+              ;;
+          esac
+          if [ "$PLATFORM" = "android" ]; then
+            if ! unzip -p "${{ steps.artifact.outputs.output }}" assets/index.android.bundle \
+              | grep -aF "$EXPO_PUBLIC_API_BASE" >/dev/null; then
+              printf '%s\n' "Android preview bundle is missing EXPO_PUBLIC_API_BASE=$EXPO_PUBLIC_API_BASE" >&2
+              exit 1
+            fi
+            if ! unzip -p "${{ steps.artifact.outputs.output }}" assets/index.android.bundle \
+              | grep -aF "$EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID" >/dev/null; then
+              printf '%s\n' "Android preview bundle is missing EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=$EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID" >&2
+              exit 1
+            fi
+          fi
 
       - name: Prepare Android native project
-        if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
+        if: env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
         timeout-minutes: 8
         working-directory: ${{ env.MOBILE_DIR }}
         env:
@@ -295,7 +321,7 @@ jobs:
           set_gradle_prop org.gradle.jvmargs "-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8"
 
       - name: Cache Gradle
-        if: matrix.platform == 'android'
+        if: env.EXPO_TOKEN == '' && matrix.platform == 'android'
         uses: actions/cache@v6
         with:
           path: |
@@ -307,14 +333,14 @@ jobs:
             ${{ runner.os }}-gradle-
 
       - name: Save generated Android project
-        if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production' && steps.android-native-cache.outputs.cache-hit != 'true'
+        if: env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production' && steps.android-native-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: ${{ env.MOBILE_DIR }}/android
           key: ${{ steps.android-native-cache.outputs.cache-primary-key }}
 
       - name: Build Android preview APK with Gradle
-        if: matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
+        if: env.EXPO_TOKEN == '' && matrix.platform == 'android' && needs.resolve.outputs.profile != 'production'
         timeout-minutes: 20
         working-directory: ${{ env.MOBILE_DIR }}
         env:
@@ -364,10 +390,10 @@ jobs:
           elif [ "$STATUS" != "success" ] && [ ! -s "$ARTIFACT_PATH" ]; then
             FAILURE_REASON="missing_mobile_artifact"
           fi
-          if [ "$PLATFORM" = "android" ] && [ "$PROFILE" != "production" ]; then
-            BUILD_MODE="android_gradle_release_debug_signed"
-          elif [ -n "${EXPO_TOKEN:-}" ]; then
+          if [ -n "${EXPO_TOKEN:-}" ]; then
             BUILD_MODE="eas_local"
+          elif [ "$PLATFORM" = "android" ] && [ "$PROFILE" != "production" ]; then
+            BUILD_MODE="android_gradle_release_debug_signed"
           else
             BUILD_MODE="unavailable"
           fi
