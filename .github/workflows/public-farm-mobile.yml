@@ -422,7 +422,7 @@ jobs:
             exit 1
           fi
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
-          ./gradlew --no-daemon --console=plain --stacktrace --build-cache --parallel "$GRADLE_TASK"
+          ./gradlew --no-daemon --no-configuration-cache --console=plain --stacktrace --build-cache --parallel "$GRADLE_TASK"
           cp "$ARTIFACT_GLOB" "${{ steps.artifact.outputs.output }}"
           if unzip -l "${{ steps.artifact.outputs.output }}" | grep -q 'lib/'; then
             if ! unzip -l "${{ steps.artifact.outputs.output }}" | grep -q 'lib/arm64-v8a/'; then
