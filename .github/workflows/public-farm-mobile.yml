@@ -181,6 +181,10 @@ jobs:
       GRADLE_TASK: ${{ needs.resolve.outputs.gradle_task }}
       ARTIFACT_GLOB: ${{ needs.resolve.outputs.artifact_glob }}
       EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      NINJADEALS_STAGING_KEYSTORE_BASE64: ${{ secrets.NINJADEALS_STAGING_KEYSTORE_BASE64 }}
+      NINJADEALS_STAGING_KEYSTORE_PASSWORD: ${{ secrets.NINJADEALS_STAGING_KEYSTORE_PASSWORD }}
+      NINJADEALS_STAGING_KEY_ALIAS: ${{ secrets.NINJADEALS_STAGING_KEY_ALIAS }}
+      NINJADEALS_STAGING_KEY_PASSWORD: ${{ secrets.NINJADEALS_STAGING_KEY_PASSWORD }}
       CI: '1'
       EXPO_NO_TELEMETRY: '1'
     steps:
@@ -242,6 +246,25 @@ jobs:
       - name: Resolve checkout SHA
         id: source
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure native Android staging signing
+        if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android' && needs.resolve.outputs.profile == 'staging'
+        run: |
+          set -euo pipefail
+          for required in \
+            NINJADEALS_STAGING_KEYSTORE_BASE64 \
+            NINJADEALS_STAGING_KEYSTORE_PASSWORD \
+            NINJADEALS_STAGING_KEY_ALIAS \
+            NINJADEALS_STAGING_KEY_PASSWORD; do
+            if [ -z "${!required:-}" ]; then
+              printf '%s\n' "Missing required native Android staging signing secret: $required" >&2
+              exit 1
+            fi
+          done
+          key_store="$RUNNER_TEMP/ninjadeals-staging.p12"
+          printf '%s' "$NINJADEALS_STAGING_KEYSTORE_BASE64" | base64 --decode > "$key_store"
+          chmod 600 "$key_store"
+          echo "NINJADEALS_STAGING_KEYSTORE_PATH=$key_store" >> "$GITHUB_ENV"
 
       - name: Setup Node
         if: needs.resolve.outputs.app_kind != 'native_android'
