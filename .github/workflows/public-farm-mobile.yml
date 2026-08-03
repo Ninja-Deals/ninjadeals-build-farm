@@ -185,6 +185,11 @@ jobs:
       NINJADEALS_STAGING_KEYSTORE_PASSWORD: ${{ secrets.NINJADEALS_STAGING_KEYSTORE_PASSWORD }}
       NINJADEALS_STAGING_KEY_ALIAS: ${{ secrets.NINJADEALS_STAGING_KEY_ALIAS }}
       NINJADEALS_STAGING_KEY_PASSWORD: ${{ secrets.NINJADEALS_STAGING_KEY_PASSWORD }}
+      NINJADEALS_RELEASE_KEYSTORE_BASE64: ${{ secrets.NINJADEALS_RELEASE_KEYSTORE_BASE64 }}
+      NINJADEALS_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.NINJADEALS_RELEASE_KEYSTORE_PASSWORD }}
+      NINJADEALS_RELEASE_KEY_ALIAS: ${{ secrets.NINJADEALS_RELEASE_KEY_ALIAS }}
+      NINJADEALS_RELEASE_KEY_PASSWORD: ${{ secrets.NINJADEALS_RELEASE_KEY_PASSWORD }}
+      ANDROID_GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON_BASE64 }}
       CI: '1'
       EXPO_NO_TELEMETRY: '1'
     steps:
@@ -247,24 +252,72 @@ jobs:
         id: source
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Configure native Android staging signing
-        if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android' && needs.resolve.outputs.profile == 'staging'
+      - name: Configure native Android release signing
+        if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android' && (needs.resolve.outputs.profile == 'staging' || needs.resolve.outputs.profile == 'production')
         run: |
           set -euo pipefail
+          if [ "$PROFILE" = 'staging' ]; then
+            key_store_base64="$NINJADEALS_STAGING_KEYSTORE_BASE64"
+            key_store_password="$NINJADEALS_STAGING_KEYSTORE_PASSWORD"
+            key_alias="$NINJADEALS_STAGING_KEY_ALIAS"
+            key_password="$NINJADEALS_STAGING_KEY_PASSWORD"
+            required_prefix='NINJADEALS_STAGING'
+          else
+            key_store_base64="$NINJADEALS_RELEASE_KEYSTORE_BASE64"
+            key_store_password="$NINJADEALS_RELEASE_KEYSTORE_PASSWORD"
+            key_alias="$NINJADEALS_RELEASE_KEY_ALIAS"
+            key_password="$NINJADEALS_RELEASE_KEY_PASSWORD"
+            required_prefix='NINJADEALS_RELEASE'
+          fi
           for required in \
-            NINJADEALS_STAGING_KEYSTORE_BASE64 \
-            NINJADEALS_STAGING_KEYSTORE_PASSWORD \
-            NINJADEALS_STAGING_KEY_ALIAS \
-            NINJADEALS_STAGING_KEY_PASSWORD; do
-            if [ -z "${!required:-}" ]; then
-              printf '%s\n' "Missing required native Android staging signing secret: $required" >&2
+            'key_store_base64:KEYSTORE_BASE64' \
+            'key_store_password:KEYSTORE_PASSWORD' \
+            'key_alias:KEY_ALIAS' \
+            'key_password:KEY_PASSWORD'; do
+            value_name="${required%%:*}"
+            secret_suffix="${required#*:}"
+            if [ -z "${!value_name:-}" ]; then
+              printf '%s\n' "Missing required native Android signing secret: ${required_prefix}_${secret_suffix}" >&2
               exit 1
             fi
           done
-          key_store="$RUNNER_TEMP/ninjadeals-staging.p12"
-          printf '%s' "$NINJADEALS_STAGING_KEYSTORE_BASE64" | base64 --decode > "$key_store"
+          key_store="$RUNNER_TEMP/ninjadeals-${PROFILE}.p12"
+          printf '%s' "$key_store_base64" | base64 --decode > "$key_store"
           chmod 600 "$key_store"
-          echo "NINJADEALS_STAGING_KEYSTORE_PATH=$key_store" >> "$GITHUB_ENV"
+          {
+            echo "NINJA_RELEASE_STORE_FILE=$key_store"
+            echo "NINJA_RELEASE_STORE_PASSWORD=$key_store_password"
+            echo "NINJA_RELEASE_KEY_ALIAS=$key_alias"
+            echo "NINJA_RELEASE_KEY_PASSWORD=$key_password"
+          } >> "$GITHUB_ENV"
+
+      - name: Materialise native Android Firebase configuration
+        if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android'
+        working-directory: ${{ needs.resolve.outputs.app_root }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANDROID_GOOGLE_SERVICES_JSON_BASE64:-}" ]; then
+            if [ "$PROFILE" = 'production' ]; then
+              printf '%s\n' 'Missing ANDROID_GOOGLE_SERVICES_JSON_BASE64 for native Android production build.' >&2
+              exit 1
+            fi
+            echo '::notice title=Native Android Firebase::No Firebase configuration supplied; non-production build will keep FCM dark.'
+            exit 0
+          fi
+          config_path='app/google-services.json'
+          config_tmp="$RUNNER_TEMP/ninjadeals-google-services.json"
+          printf '%s' "$ANDROID_GOOGLE_SERVICES_JSON_BASE64" | base64 --decode > "$config_tmp"
+          jq -e '
+            .project_info.project_id == "ninja-819de" and
+            ([.client[]?.client_info.android_client_info.package_name] | sort) == [
+              "com.ninjadeals.app",
+              "com.ninjadeals.app.internal",
+              "com.ninjadeals.app.staging"
+            ]
+          ' "$config_tmp" >/dev/null
+          mkdir -p "$(dirname "$config_path")"
+          mv "$config_tmp" "$config_path"
+          chmod 600 "$config_path"
 
       - name: Setup Node
         if: needs.resolve.outputs.app_kind != 'native_android'
@@ -453,6 +506,11 @@ jobs:
               exit 1
             fi
           fi
+
+      - name: Remove native Android Firebase configuration
+        if: always() && needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android'
+        working-directory: ${{ needs.resolve.outputs.app_root }}
+        run: rm -f app/google-services.json
 
       - name: Verify mobile binary artifact
         run: |
