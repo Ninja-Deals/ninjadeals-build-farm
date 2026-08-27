@@ -567,8 +567,9 @@ jobs:
 
       - name: Remove native Android Firebase configuration
         if: always() && needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android'
-        working-directory: ${{ needs.resolve.outputs.app_root }}
-        run: rm -f app/google-services.json
+        run: |
+          config_path="${GITHUB_WORKSPACE}/${APP_ROOT}/app/google-services.json"
+          if [ -f "$config_path" ]; then rm -f "$config_path"; fi
 
       - name: Verify mobile binary artifact
         run: |
