@@ -47,6 +47,9 @@ jobs:
       gradle_task: ${{ steps.inputs.outputs.gradle_task }}
       artifact_glob: ${{ steps.inputs.outputs.artifact_glob }}
       artifact_ext: ${{ steps.inputs.outputs.artifact_ext }}
+      size_policy: ${{ steps.inputs.outputs.size_policy }}
+      max_artifact_bytes: ${{ steps.inputs.outputs.max_artifact_bytes }}
+      require_signed: ${{ steps.inputs.outputs.require_signed }}
       matrix: ${{ steps.inputs.outputs.matrix }}
       platforms: ${{ steps.inputs.outputs.platforms }}
       requested_platforms: ${{ steps.inputs.outputs.requested_platforms }}
@@ -68,6 +71,9 @@ jobs:
           GRADLE_TASK_PAYLOAD: ${{ github.event.client_payload.gradle_task }}
           ARTIFACT_GLOB_PAYLOAD: ${{ github.event.client_payload.artifact_glob }}
           ARTIFACT_EXT_PAYLOAD: ${{ github.event.client_payload.artifact_ext }}
+          SIZE_POLICY_PAYLOAD: ${{ github.event.client_payload.size_policy }}
+          MAX_ARTIFACT_BYTES_PAYLOAD: ${{ github.event.client_payload.max_artifact_bytes }}
+          REQUIRE_SIGNED_PAYLOAD: ${{ github.event.client_payload.require_signed }}
           ISSUE_INPUT: ${{ inputs.issue }}
           ISSUE_PAYLOAD: ${{ github.event.client_payload.issue }}
           IOS_BUILDS_PAUSED: ${{ env.IOS_BUILDS_PAUSED }}
@@ -94,6 +100,9 @@ jobs:
           gradle_task = first(os.getenv("GRADLE_TASK_PAYLOAD"), default="")
           artifact_glob = first(os.getenv("ARTIFACT_GLOB_PAYLOAD"), default="")
           artifact_ext = first(os.getenv("ARTIFACT_EXT_PAYLOAD"), default="")
+          size_policy = first(os.getenv("SIZE_POLICY_PAYLOAD"), default="")
+          max_artifact_bytes = first(os.getenv("MAX_ARTIFACT_BYTES_PAYLOAD"), default="")
+          require_signed = first(os.getenv("REQUIRE_SIGNED_PAYLOAD"), default="")
 
           if app_kind not in {"legacy_expo", "native_android"}:
               raise SystemExit(f"Invalid app_kind: {app_kind}")
@@ -106,8 +115,29 @@ jobs:
                   artifact_glob = "app/build/outputs/apk/internal/debug/app-internal-debug.apk"
               if not artifact_ext:
                   artifact_ext = "apk"
+              if profile == "production":
+                  if artifact_ext != "aab":
+                      raise SystemExit("native Android production builds must publish an AAB")
+                  size_policy = size_policy or "enforce"
+                  max_artifact_bytes = max_artifact_bytes or "31457280"
+                  require_signed = require_signed or "true"
+
           else:
               app_root = "mobile"
+
+          if size_policy not in {"", "report", "enforce"}:
+              raise SystemExit("size_policy must be report or enforce")
+          if not size_policy:
+              size_policy = "report"
+          try:
+              max_artifact_bytes = int(max_artifact_bytes) if max_artifact_bytes else 0
+          except ValueError as exc:
+              raise SystemExit("max_artifact_bytes must be an integer") from exc
+          if size_policy == "enforce" and max_artifact_bytes <= 0:
+              raise SystemExit("an enforced size policy requires max_artifact_bytes > 0")
+          if require_signed not in {"", "true", "false"}:
+              raise SystemExit("require_signed must be true or false")
+          require_signed = require_signed == "true"
 
           payload = os.getenv("PLATFORMS_PAYLOAD", "null")
           try:
@@ -154,6 +184,9 @@ jobs:
               fh.write(f"gradle_task={gradle_task}\n")
               fh.write(f"artifact_glob={artifact_glob}\n")
               fh.write(f"artifact_ext={artifact_ext}\n")
+              fh.write(f"size_policy={size_policy}\n")
+              fh.write(f"max_artifact_bytes={max_artifact_bytes}\n")
+              fh.write(f"require_signed={'true' if require_signed else 'false'}\n")
               fh.write(f"platforms={','.join(platforms)}\n")
               fh.write(f"requested_platforms={','.join(requested_platforms)}\n")
               fh.write(f"ios_paused={'true' if ios_paused else 'false'}\n")
@@ -180,6 +213,9 @@ jobs:
       APP_ROOT: ${{ needs.resolve.outputs.app_root }}
       GRADLE_TASK: ${{ needs.resolve.outputs.gradle_task }}
       ARTIFACT_GLOB: ${{ needs.resolve.outputs.artifact_glob }}
+      SIZE_POLICY: ${{ needs.resolve.outputs.size_policy }}
+      MAX_ARTIFACT_BYTES: ${{ needs.resolve.outputs.max_artifact_bytes }}
+      REQUIRE_SIGNED: ${{ needs.resolve.outputs.require_signed }}
       EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
       NINJADEALS_STAGING_KEYSTORE_BASE64: ${{ secrets.NINJADEALS_STAGING_KEYSTORE_BASE64 }}
       NINJADEALS_STAGING_KEYSTORE_PASSWORD: ${{ secrets.NINJADEALS_STAGING_KEYSTORE_PASSWORD }}
@@ -189,6 +225,7 @@ jobs:
       NINJADEALS_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.NINJADEALS_RELEASE_KEYSTORE_PASSWORD }}
       NINJADEALS_RELEASE_KEY_ALIAS: ${{ secrets.NINJADEALS_RELEASE_KEY_ALIAS }}
       NINJADEALS_RELEASE_KEY_PASSWORD: ${{ secrets.NINJADEALS_RELEASE_KEY_PASSWORD }}
+      NINJA_PRODUCTION_GOOGLE_SERVER_CLIENT_ID: ${{ secrets.NINJADEALS_PRODUCTION_GOOGLE_SERVER_CLIENT_ID }}
       ANDROID_GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON_BASE64 }}
       CI: '1'
       EXPO_NO_TELEMETRY: '1'
@@ -216,6 +253,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$APP_KIND" = "native_android" ]; then
+            if [ "$PROFILE" = "production" ] && [ -z "${NINJA_PRODUCTION_GOOGLE_SERVER_CLIENT_ID:-}" ]; then
+              printf '%s\n' 'Missing NINJADEALS_PRODUCTION_GOOGLE_SERVER_CLIENT_ID for native Android production build.' >&2
+              exit 1
+            fi
             echo "::notice title=Native Android build::Building clean-room native Android artifact from android/ with Gradle."
             exit 0
           fi
@@ -506,6 +547,23 @@ jobs:
               exit 1
             fi
           fi
+
+      - name: Enforce native Android production artifact policy
+        if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android' && needs.resolve.outputs.profile == 'production'
+        run: |
+          set -euo pipefail
+          artifact="${{ steps.artifact.outputs.output }}"
+          [[ "$artifact" == *.aab ]] || { printf '%s\n' 'Production native Android artifact must be an AAB.' >&2; exit 1; }
+          [[ -s "$artifact" ]] || { printf '%s\n' "Missing production AAB: $artifact" >&2; exit 1; }
+          actual_bytes="$(stat --format=%s "$artifact")"
+          if [ "$SIZE_POLICY" = 'enforce' ] && [ "$actual_bytes" -gt "$MAX_ARTIFACT_BYTES" ]; then
+            printf '%s\n' "Production AAB is ${actual_bytes} bytes; limit is ${MAX_ARTIFACT_BYTES} bytes." >&2
+            exit 1
+          fi
+          if [ "$REQUIRE_SIGNED" = 'true' ]; then
+            jarsigner -verify -strict "$artifact" >/dev/null
+          fi
+          printf 'Production AAB policy passed: %s bytes (limit %s, signed=%s).\n' "$actual_bytes" "$MAX_ARTIFACT_BYTES" "$REQUIRE_SIGNED"
 
       - name: Remove native Android Firebase configuration
         if: always() && needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android'
