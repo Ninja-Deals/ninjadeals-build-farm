@@ -336,12 +336,53 @@ jobs:
           # never touches a tagged or in-use image.
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
-            "exec 9>/tmp/ninja-deploy.lock; \
-             flock -w 1200 9 || { echo 'deploy-lock: timed out waiting for a concurrent deploy to release the lock'; exit 1; }; \
-             sudo docker image prune -f 2>/dev/null || true; \
-             cd /opt/ninjadeals/services && \
-             sudo docker compose -f services.yml pull --quiet $DEPLOY_SERVICES && \
-             sudo docker compose -f services.yml up -d $DEPLOY_SERVICES"
+            "bash -s -- '$DEPLOY_SERVICES'" <<'REMOTE'
+          set -euo pipefail
+          DEPLOY_SERVICES="$1"
+          COMPOSE='sudo docker compose -f services.yml'
+
+          exec 9>/tmp/ninja-deploy.lock
+          flock -w 1200 9 || { echo 'deploy-lock: timed out waiting for a concurrent deploy to release the lock'; exit 1; }
+          sudo docker image prune -f 2>/dev/null || true
+          cd /opt/ninjadeals/services
+          $COMPOSE pull --quiet $DEPLOY_SERVICES
+
+          NON_FRONTEND_SERVICES=''
+          for svc in $DEPLOY_SERVICES; do
+            case "$svc" in
+              frontend|frontend-2) ;;
+              *) NON_FRONTEND_SERVICES="$NON_FRONTEND_SERVICES $svc" ;;
+            esac
+          done
+          if [ -n "${NON_FRONTEND_SERVICES// }" ]; then
+            $COMPOSE up -d $NON_FRONTEND_SERVICES
+          fi
+
+          # Do not recreate both frontend replicas together. That leaves the OCI
+          # load balancer with no Node target and makes visitors see a 502 during
+          # an otherwise healthy rollout. Keep one old replica serving while its
+          # sibling is recreated, and wait for the host-published health endpoint
+          # before touching the next replica.
+          for svc in frontend frontend-2; do
+            case " $DEPLOY_SERVICES " in
+              *" $svc "*) ;;
+              *) continue ;;
+            esac
+            echo "Rolling $svc..."
+            $COMPOSE up -d --no-deps --force-recreate "$svc"
+            FRONTEND_CODE=000
+            for attempt in $(seq 1 12); do
+              PORT=$(sudo docker port "$svc" 3000/tcp 2>/dev/null | head -n1 | sed 's/.*://')
+              if [ -n "$PORT" ] && curl --connect-timeout 2 -m 5 -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/healthz" | grep -qx 200; then
+                FRONTEND_CODE=200
+                break
+              fi
+              sleep 5
+            done
+            [ "$FRONTEND_CODE" = 200 ] || { echo "$svc did not become ready (/healthz: $FRONTEND_CODE)"; exit 1; }
+            echo "$svc is ready."
+          done
+          REMOTE
           echo "All services deployed."
 
       - name: Close Tunnel
