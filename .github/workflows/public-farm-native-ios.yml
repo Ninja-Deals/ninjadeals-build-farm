@@ -203,13 +203,13 @@ jobs:
             echo "Simulator build did not produce an installable NinjaDeals.app" >&2
             exit 1
           fi
-          device_id="$(xcrun simctl list devices available --json | python3 -c '
+          device_record="$(xcrun simctl list devices available --json | python3 -c '
           import json
           import sys
 
           devices = json.load(sys.stdin).get("devices", {})
           candidates = [
-              device
+              (runtime, device)
               for runtime, runtime_devices in devices.items()
               if "iOS" in runtime
               for device in runtime_devices
@@ -217,8 +217,11 @@ jobs:
           ]
           if not candidates:
               raise SystemExit("no available iPhone simulator is installed")
-          print(candidates[-1]["udid"])
+          runtime, device = candidates[-1]
+          os_version = runtime.rsplit("iOS-", 1)[-1].replace("-", ".")
+          print(device["udid"], device["name"], os_version, sep="\t")
           ')"
+          IFS=$'\t' read -r device_id device_name device_os <<< "$device_record"
           xcrun simctl boot "$device_id" 2>/dev/null || true
           xcrun simctl bootstatus "$device_id" -b
           xcrun simctl install "$device_id" "$app"
@@ -228,6 +231,12 @@ jobs:
             com.ninjadeals.app.staging:\ *) ;;
             *) echo "Simulator launch did not return a NinjaDeals process identifier" >&2; exit 1 ;;
           esac
+          export NJD_RUN_ID="build-farm-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          scripts/test/run-ios-e2e.sh \
+            --severity smoke \
+            --destination "platform=iOS Simulator,name=$device_name,OS=$device_os" \
+            --profile current-ios-60hz-iphone \
+            --artifact-dir "$RUNNER_TEMP/native-ios-smoke"
           xcrun simctl terminate "$device_id" com.ninjadeals.app.staging
           xcrun simctl shutdown "$device_id"
 
@@ -261,6 +270,15 @@ jobs:
             ${{ runner.temp }}/native-ios/*.ipa
             ${{ runner.temp }}/native-ios/*.zip
             ${{ runner.temp }}/native-ios/build-metadata.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload native iOS Smoke runtime evidence
+        if: always() && steps.inputs.outputs.profile == 'simulator'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ninjadeals-native-ios-smoke-${{ github.run_number }}
+          path: ${{ runner.temp }}/native-ios-smoke/ios-e2e
           if-no-files-found: error
           retention-days: 30
 
