@@ -115,6 +115,7 @@ jobs:
       - name: Select pinned Xcode
         run: |
           sudo xcode-select --switch /Applications/Xcode_26.6.app/Contents/Developer
+          brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
           ios/scripts/verify-xcode-installation.sh
 
       - name: Configure isolated Apple signing custody
