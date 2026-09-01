@@ -1,0 +1,251 @@
+name: Public Farm Native iOS Build
+run-name: Native iOS ${{ github.event.client_payload.profile || inputs.profile || 'simulator' }} from ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
+
+on:
+  repository_dispatch:
+    types: [trigger-native-ios-build]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: ninjadeals-main ref to build
+        required: false
+        default: main
+      profile:
+        description: Native iOS artifact profile
+        required: true
+        type: choice
+        default: simulator
+        options:
+          - simulator
+          - staging
+          - production
+      build_number:
+        description: Optional positive CFBundleVersion override
+        required: false
+        default: ''
+      marketing_version:
+        description: Optional semantic CFBundleShortVersionString override
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  MONOREPO: Ninja-Deals/ninjadeals-main
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    concurrency:
+      group: native-ios-${{ github.event.client_payload.ref || inputs.ref || 'main' }}-${{ github.event.client_payload.profile || inputs.profile || 'simulator' }}
+      cancel-in-progress: false
+    steps:
+      - name: Resolve and validate inputs
+        id: inputs
+        env:
+          REF_PAYLOAD: ${{ github.event.client_payload.ref }}
+          REF_INPUT: ${{ inputs.ref }}
+          SHA_PAYLOAD: ${{ github.event.client_payload.sha }}
+          PROFILE_PAYLOAD: ${{ github.event.client_payload.profile }}
+          PROFILE_INPUT: ${{ inputs.profile }}
+          BUILD_PAYLOAD: ${{ github.event.client_payload.build_number }}
+          BUILD_INPUT: ${{ inputs.build_number }}
+          VERSION_PAYLOAD: ${{ github.event.client_payload.marketing_version }}
+          VERSION_INPUT: ${{ inputs.marketing_version }}
+        run: |
+          python3 <<'PY'
+          import os
+          import re
+
+          def first(*values, default=''):
+              for value in values:
+                  value = str(value or '').strip()
+                  if value and value != 'null':
+                      return value
+              return default
+
+          ref = first(os.getenv('REF_PAYLOAD'), os.getenv('REF_INPUT'), default='main')
+          revision = first(os.getenv('SHA_PAYLOAD'))
+          profile = first(os.getenv('PROFILE_PAYLOAD'), os.getenv('PROFILE_INPUT'), default='simulator')
+          build = first(os.getenv('BUILD_PAYLOAD'), os.getenv('BUILD_INPUT'))
+          version = first(os.getenv('VERSION_PAYLOAD'), os.getenv('VERSION_INPUT'))
+          if profile not in {'simulator', 'staging', 'production'}:
+              raise SystemExit(f'invalid native iOS profile: {profile}')
+          if revision and not re.fullmatch(r'[0-9a-f]{40}', revision):
+              raise SystemExit('sha must be a complete lowercase Git revision')
+          if build and not re.fullmatch(r'[1-9][0-9]*', build):
+              raise SystemExit('build_number must be a positive integer')
+          if version and not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[.-][A-Za-z0-9]+)*', version):
+              raise SystemExit('marketing_version must be semantic')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              for key, value in {
+                  'ref': ref,
+                  'sha': revision,
+                  'profile': profile,
+                  'build_number': build,
+                  'marketing_version': version,
+                  'signed': 'false' if profile == 'simulator' else 'true',
+              }.items():
+                  output.write(f'{key}={value}\n')
+          PY
+
+      - name: Checkout private monorepo
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.MONOREPO }}
+          ref: ${{ steps.inputs.outputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
+      - name: Verify immutable source revision
+        id: source
+        env:
+          EXPECTED_SHA: ${{ steps.inputs.outputs.sha }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [ -n "$EXPECTED_SHA" ] && [ "$actual" != "$EXPECTED_SHA" ]; then
+            echo "Requested revision $EXPECTED_SHA but checkout resolved $actual" >&2
+            exit 1
+          fi
+          echo "sha=$actual" >> "$GITHUB_OUTPUT"
+
+      - name: Select pinned Xcode
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.6.app/Contents/Developer
+          ios/scripts/verify-xcode-installation.sh
+
+      - name: Configure isolated Apple signing custody
+        if: steps.inputs.outputs.signed == 'true'
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.IOS_BUILD_KEYCHAIN_PASSWORD }}
+          APP_PROFILE_BASE64: ${{ secrets.IOS_APP_PROVISIONING_PROFILE_BASE64 }}
+          SHARE_PROFILE_BASE64: ${{ secrets.IOS_SHARE_PROVISIONING_PROFILE_BASE64 }}
+          WIDGET_PROFILE_BASE64: ${{ secrets.IOS_WIDGET_PROVISIONING_PROFILE_BASE64 }}
+          EXPORT_OPTIONS_BASE64: ${{ secrets.IOS_EXPORT_OPTIONS_PLIST_BASE64 }}
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in CERTIFICATE_BASE64 CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD APP_PROFILE_BASE64 SHARE_PROFILE_BASE64 WIDGET_PROFILE_BASE64 EXPORT_OPTIONS_BASE64 TEAM_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing required native iOS signing secret: $name" >&2
+              exit 2
+            fi
+          done
+          keychain="$RUNNER_TEMP/ninjadeals-ios.keychain-db"
+          certificate="$RUNNER_TEMP/ninjadeals-ios.p12"
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$certificate"
+          chmod 600 "$certificate"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+
+          profiles="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$profiles"
+          for name in APP_PROFILE_BASE64 SHARE_PROFILE_BASE64 WIDGET_PROFILE_BASE64; do
+            encoded="${!name}"
+            raw="$RUNNER_TEMP/${name}.mobileprovision"
+            decoded="$RUNNER_TEMP/${name}.plist"
+            printf '%s' "$encoded" | base64 --decode > "$raw"
+            security cms -D -i "$raw" > "$decoded"
+            uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$decoded")"
+            cp "$raw" "$profiles/$uuid.mobileprovision"
+          done
+          export_options="$RUNNER_TEMP/ExportOptions.plist"
+          printf '%s' "$EXPORT_OPTIONS_BASE64" | base64 --decode > "$export_options"
+          plutil -lint "$export_options"
+          {
+            echo "NINJADEALS_TEAM_ID=$TEAM_ID"
+            echo "NJD_IOS_EXPORT_OPTIONS_PLIST=$export_options"
+            echo "NJD_IOS_EPHEMERAL_KEYCHAIN=$keychain"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify native project, package, metadata and release controls
+        run: ios/scripts/verify-native-project.sh --static-only
+
+      - name: Build unsigned simulator artifact
+        if: steps.inputs.outputs.profile == 'simulator'
+        env:
+          NJD_IOS_BUILD_NUMBER: ${{ steps.inputs.outputs.build_number }}
+          NJD_IOS_MARKETING_VERSION: ${{ steps.inputs.outputs.marketing_version }}
+        run: |
+          args=(--profile staging --output-dir "$RUNNER_TEMP/native-ios" --unsigned-simulator)
+          [ -n "$NJD_IOS_BUILD_NUMBER" ] && args+=(--build-number "$NJD_IOS_BUILD_NUMBER")
+          [ -n "$NJD_IOS_MARKETING_VERSION" ] && args+=(--marketing-version "$NJD_IOS_MARKETING_VERSION")
+          ios/scripts/archive.sh "${args[@]}"
+
+      - name: Build signed device artifact
+        if: steps.inputs.outputs.signed == 'true'
+        env:
+          PROFILE: ${{ steps.inputs.outputs.profile }}
+          NJD_IOS_BUILD_NUMBER: ${{ steps.inputs.outputs.build_number }}
+          NJD_IOS_MARKETING_VERSION: ${{ steps.inputs.outputs.marketing_version }}
+        run: |
+          args=(--profile "$PROFILE" --output-dir "$RUNNER_TEMP/native-ios" --export-options "$NJD_IOS_EXPORT_OPTIONS_PLIST")
+          [ -n "$NJD_IOS_BUILD_NUMBER" ] && args+=(--build-number "$NJD_IOS_BUILD_NUMBER")
+          [ -n "$NJD_IOS_MARKETING_VERSION" ] && args+=(--marketing-version "$NJD_IOS_MARKETING_VERSION")
+          ios/scripts/archive.sh "${args[@]}"
+
+      - name: Verify attributable build metadata
+        env:
+          EXPECTED_SHA: ${{ steps.source.outputs.sha }}
+          PROFILE: ${{ steps.inputs.outputs.profile }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['RUNNER_TEMP']) / 'native-ios'
+          metadata = json.loads((root / 'build-metadata.json').read_text(encoding='utf-8'))
+          if metadata['sourceRevision'] != os.environ['EXPECTED_SHA']:
+              raise SystemExit('artifact metadata source revision mismatch')
+          expected_environment = 'staging' if os.environ['PROFILE'] == 'simulator' else os.environ['PROFILE']
+          if metadata['environment'] != expected_environment:
+              raise SystemExit('artifact metadata environment mismatch')
+          artifact = root / metadata['artifact']
+          if not artifact.is_file() or artifact.stat().st_size == 0:
+              raise SystemExit('artifact metadata names a missing artifact')
+          PY
+
+      - name: Upload native iOS artifact and dSYM archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: ninjadeals-native-ios-${{ steps.inputs.outputs.profile }}-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/native-ios/*.ipa
+            ${{ runner.temp }}/native-ios/*.zip
+            ${{ runner.temp }}/native-ios/build-metadata.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summarize native iOS build
+        if: always()
+        run: |
+          {
+            echo '### NinjaDeals native iOS build'
+            echo
+            echo '| Field | Value |'
+            echo '|---|---|'
+            echo '| Status | ${{ job.status }} |'
+            echo '| Profile | ${{ steps.inputs.outputs.profile }} |'
+            echo '| Ref | ${{ steps.inputs.outputs.ref }} |'
+            echo '| Revision | ${{ steps.source.outputs.sha }} |'
+            echo '| Xcode | 26.6 (17F113) |'
+            echo '| Artifact | ninjadeals-native-ios-${{ steps.inputs.outputs.profile }}-${{ github.run_number }} |'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove ephemeral signing material
+        if: always() && steps.inputs.outputs.signed == 'true'
+        run: |
+          set +e
+          security delete-keychain "${NJD_IOS_EPHEMERAL_KEYCHAIN:-$RUNNER_TEMP/ninjadeals-ios.keychain-db}"
+          rm -f "$RUNNER_TEMP"/*.p12 "$RUNNER_TEMP"/*.mobileprovision "$RUNNER_TEMP"/ExportOptions.plist
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles"/*.mobileprovision
