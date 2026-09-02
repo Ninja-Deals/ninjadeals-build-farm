@@ -237,8 +237,11 @@ jobs:
             --destination "platform=iOS Simulator,name=$device_name,OS=$device_os" \
             --profile current-ios-60hz-iphone \
             --artifact-dir "$RUNNER_TEMP/native-ios-smoke"
-          xcrun simctl terminate "$device_id" com.ninjadeals.app.staging
-          xcrun simctl shutdown "$device_id"
+          # XCUITest may already terminate the application after the selected
+          # method completes. Cleanup is best-effort and must not overwrite a
+          # successful retained test result.
+          xcrun simctl terminate "$device_id" com.ninjadeals.app.staging 2>/dev/null || true
+          xcrun simctl shutdown "$device_id" 2>/dev/null || true
 
       - name: Verify attributable build metadata
         env:
