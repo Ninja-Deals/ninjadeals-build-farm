@@ -250,7 +250,12 @@ jobs:
         run: |
           python3 <<'PY'
           import os
+          import sys
           from pathlib import Path
+
+          repo = Path.cwd()
+          sys.path.insert(0, str(repo / 'scripts' / 'test' / 'matrix'))
+          import ios_metadata
 
           metadata_path = (
               Path(os.environ['RUNNER_TEMP'])
@@ -268,6 +273,7 @@ jobs:
               'schema_version': '1',
               'git_head': os.environ['EXPECTED_SHA'],
               'git_clean': 'true',
+              'ios_evidence_revision': ios_metadata.current_evidence_revision(str(repo)),
               'repeat_attempt': '1',
               'repeat_total': '1',
               'xcodebuild_attempted': 'true',
