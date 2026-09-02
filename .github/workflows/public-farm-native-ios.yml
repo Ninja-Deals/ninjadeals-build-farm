@@ -243,6 +243,55 @@ jobs:
           xcrun simctl terminate "$device_id" com.ninjadeals.app.staging 2>/dev/null || true
           xcrun simctl shutdown "$device_id" 2>/dev/null || true
 
+      - name: Verify attributable Smoke runtime metadata
+        if: steps.inputs.outputs.profile == 'simulator'
+        env:
+          EXPECTED_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          metadata_path = (
+              Path(os.environ['RUNNER_TEMP'])
+              / 'native-ios-smoke'
+              / 'ios-e2e'
+              / 'metadata.env'
+          )
+          metadata = {
+              key: value
+              for line in metadata_path.read_text(encoding='utf-8').splitlines()
+              if '=' in line
+              for key, value in [line.split('=', 1)]
+          }
+          expected = {
+              'schema_version': '1',
+              'git_head': os.environ['EXPECTED_SHA'],
+              'git_clean': 'true',
+              'repeat_attempt': '1',
+              'repeat_total': '1',
+              'xcodebuild_attempted': 'true',
+              'failed': 'false',
+              'evidence_failed': 'false',
+              'flake': 'false',
+              'fixture_preflight': 'passed',
+              'preflight': 'passed',
+          }
+          mismatches = {
+              key: (metadata.get(key), value)
+              for key, value in expected.items()
+              if metadata.get(key) != value
+          }
+          if mismatches:
+              raise SystemExit(
+                  'Smoke evidence metadata is not attributable and clean: '
+                  + ', '.join(
+                      f'{key}=actual:{actual!r}/expected:{wanted!r}'
+                      for key, (actual, wanted) in sorted(mismatches.items())
+                  )
+              )
+          PY
+
       - name: Verify attributable build metadata
         env:
           EXPECTED_SHA: ${{ steps.source.outputs.sha }}
