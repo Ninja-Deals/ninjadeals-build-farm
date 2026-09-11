@@ -95,8 +95,11 @@ jobs:
           sha = first(os.getenv("SHA_PAYLOAD"), default="")
           profile = first(os.getenv("PROFILE_PAYLOAD"), os.getenv("PROFILE_INPUT"), default="preview")
           issue = first(os.getenv("ISSUE_PAYLOAD"), os.getenv("ISSUE_INPUT"), default="")
-          app_kind = first(os.getenv("APP_KIND_PAYLOAD"), default="legacy_expo")
-          app_root = first(os.getenv("APP_ROOT_PAYLOAD"), default="mobile")
+          # The Expo application root was removed. A manual Android build must therefore
+          # default to the maintained native client rather than attempting to restore a
+          # nonexistent mobile/package-lock.json tree.
+          app_kind = first(os.getenv("APP_KIND_PAYLOAD"), default="native_android")
+          app_root = first(os.getenv("APP_ROOT_PAYLOAD"), default="android")
           gradle_task = first(os.getenv("GRADLE_TASK_PAYLOAD"), default="")
           artifact_glob = first(os.getenv("ARTIFACT_GLOB_PAYLOAD"), default="")
           artifact_ext = first(os.getenv("ARTIFACT_EXT_PAYLOAD"), default="")
@@ -110,11 +113,27 @@ jobs:
               if app_root != "android":
                   raise SystemExit("native_android builds must use app_root=android")
               if not gradle_task:
-                  gradle_task = ":app:assembleInternalDebug"
+                  gradle_task = (
+                      ":app:assembleStagingRelease"
+                      if profile == "staging"
+                      else ":app:bundleProductionRelease"
+                      if profile == "production"
+                      else ":app:assembleInternalDebug"
+                  )
               if not artifact_glob:
-                  artifact_glob = "app/build/outputs/apk/internal/debug/app-internal-debug.apk"
+                  artifact_glob = (
+                      "app/build/outputs/apk/staging/release/app-staging-release.apk"
+                      if profile == "staging"
+                      else "app/build/outputs/bundle/productionRelease/app-production-release.aab"
+                      if profile == "production"
+                      else "app/build/outputs/apk/internal/debug/app-internal-debug.apk"
+                  )
               if not artifact_ext:
-                  artifact_ext = "apk"
+                  artifact_ext = "aab" if profile == "production" else "apk"
+              if profile == "staging":
+                  size_policy = size_policy or "enforce"
+                  max_artifact_bytes = max_artifact_bytes or "31457280"
+                  require_signed = require_signed or "true"
               if profile == "production":
                   if artifact_ext != "aab":
                       raise SystemExit("native Android production builds must publish an AAB")
@@ -373,7 +392,7 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: ${{ needs.resolve.outputs.app_kind == 'native_android' && '25' || '17' }}
+          java-version: ${{ needs.resolve.outputs.app_kind == 'native_android' && '21' || '17' }}
 
       - name: Setup Android SDK
         if: matrix.platform == 'android'
