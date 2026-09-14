@@ -12,11 +12,11 @@ on:
         required: false
         default: ''
       source_ref:
-        description: 'Full private monorepo commit for isolated Identity build-only mode.'
+        description: 'Full private monorepo commit for isolated Identity or Notification build-only mode.'
         required: false
         default: ''
       build_only:
-        description: 'Build only Identity at source_ref; skip all deployment and OCI jobs.'
+        description: 'Build only Identity or Notification at source_ref; skip all deployment and OCI jobs.'
         type: boolean
         required: false
         default: false
@@ -38,7 +38,7 @@ jobs:
       source_ref: ${{ steps.isolated.outputs.source_ref }}
       isolated_build: ${{ steps.isolated.outputs.isolated_build }}
     steps:
-      - name: Validate isolated Identity build request
+      - name: Validate isolated service build request
         id: isolated
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -50,7 +50,7 @@ jobs:
           isolated=false
           if [ -n "$REQUESTED_SOURCE" ] || [ "$BUILD_ONLY" = true ]; then
             [ "$EVENT_NAME" = workflow_dispatch ]
-            [ "$REQUESTED_SERVICES" = identity ]
+            case "$REQUESTED_SERVICES" in identity|notification) ;; *) exit 1 ;; esac
             [ "$BUILD_ONLY" = true ]
             [[ "$REQUESTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
             isolated=true
@@ -150,9 +150,14 @@ jobs:
           IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:latest"
           METADATA_ARGS=()
           if [ "$ISOLATED_BUILD" = true ]; then
-            [ "${{ matrix.service }}" = identity ]
-            IMAGE="ghcr.io/ninja-deals/ninjadeals-main/identity:ios082-${PRIVATE_SOURCE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            METADATA_ARGS=(--metadata-file "$RUNNER_TEMP/identity-build-metadata.json")
+            case "${{ matrix.service }}" in
+              identity) TAG_PREFIX=ios082 ;;
+              notification) TAG_PREFIX=ios153 ;;
+              *) exit 1 ;;
+            esac
+            IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:${TAG_PREFIX}-${PRIVATE_SOURCE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            METADATA_FILE="$RUNNER_TEMP/${{ matrix.service }}-build-metadata.json"
+            METADATA_ARGS=(--metadata-file "$METADATA_FILE")
           fi
           # Push image layers compressed with zstd instead of the default gzip.
           # The apps-VM deploy is unpack-bound, not network-bound (link does 67-207
@@ -188,7 +193,7 @@ jobs:
               $ZSTD_PUSH "${METADATA_ARGS[@]}" -f services/${{ matrix.service }}/Dockerfile -t "$IMAGE" .
           fi
           if [ "$ISOLATED_BUILD" = true ]; then
-            DIGEST=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/identity-build-metadata.json")
+            DIGEST=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "$METADATA_FILE")
             printf 'private_source=%s\nimage_tag=%s\nimage_digest=%s\n' "$PRIVATE_SOURCE" "$IMAGE" "$DIGEST"
           fi
 
