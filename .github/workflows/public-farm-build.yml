@@ -11,6 +11,15 @@ on:
         description: 'Services to build+deploy (comma-separated). Leave empty for all 26.'
         required: false
         default: ''
+      source_ref:
+        description: 'Full private monorepo commit for isolated Identity build-only mode.'
+        required: false
+        default: ''
+      build_only:
+        description: 'Build only Identity at source_ref; skip all deployment and OCI jobs.'
+        type: boolean
+        required: false
+        default: false
   repository_dispatch:
     types: [trigger-build]
 
@@ -26,7 +35,27 @@ jobs:
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       services: ${{ steps.set-matrix.outputs.services }}
+      source_ref: ${{ steps.isolated.outputs.source_ref }}
+      isolated_build: ${{ steps.isolated.outputs.isolated_build }}
     steps:
+      - name: Validate isolated Identity build request
+        id: isolated
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_SERVICES: ${{ inputs.services }}
+          REQUESTED_SOURCE: ${{ inputs.source_ref }}
+          BUILD_ONLY: ${{ inputs.build_only }}
+        run: |
+          set -euo pipefail
+          isolated=false
+          if [ -n "$REQUESTED_SOURCE" ] || [ "$BUILD_ONLY" = true ]; then
+            [ "$EVENT_NAME" = workflow_dispatch ]
+            [ "$REQUESTED_SERVICES" = identity ]
+            [ "$BUILD_ONLY" = true ]
+            [[ "$REQUESTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+            isolated=true
+          fi
+          printf 'isolated_build=%s\nsource_ref=%s\n' "$isolated" "$REQUESTED_SOURCE" >> "$GITHUB_OUTPUT"
       - name: Resolve service list
         id: set-matrix
         run: |
@@ -61,6 +90,7 @@ jobs:
   build:
     needs: setup
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ needs.setup.outputs.isolated_build == 'true' && 30 || 360 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
@@ -75,6 +105,17 @@ jobs:
         with:
           repository: 'Ninja-Deals/ninjadeals-main'
           token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+
+      - name: Verify isolated private source checkout
+        if: needs.setup.outputs.isolated_build == 'true'
+        env:
+          EXPECTED_SOURCE: ${{ needs.setup.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE" ]
+          [ -z "$(git status --porcelain)" ]
+          printf 'private_source=%s\n' "$EXPECTED_SOURCE"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -101,8 +142,18 @@ jobs:
           password: ${{ secrets.PRIVATE_REPO_PAT }}
 
       - name: Build and Push ${{ matrix.service }} (ARM64)
+        env:
+          ISOLATED_BUILD: ${{ needs.setup.outputs.isolated_build }}
+          PRIVATE_SOURCE: ${{ needs.setup.outputs.source_ref }}
         run: |
+          set -euo pipefail
           IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:latest"
+          METADATA_ARGS=()
+          if [ "$ISOLATED_BUILD" = true ]; then
+            [ "${{ matrix.service }}" = identity ]
+            IMAGE="ghcr.io/ninja-deals/ninjadeals-main/identity:ios082-${PRIVATE_SOURCE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            METADATA_ARGS=(--metadata-file "$RUNNER_TEMP/identity-build-metadata.json")
+          fi
           # Push image layers compressed with zstd instead of the default gzip.
           # The apps-VM deploy is unpack-bound, not network-bound (link does 67-207
           # MB/s but a single image unpacks at ~8.6 MB/s) — the cost is layer
@@ -134,7 +185,11 @@ jobs:
             docker buildx build --platform linux/arm64 \
               --cache-from=type=gha,scope=${{ matrix.service }} \
               --cache-to=type=gha,mode=max,scope=${{ matrix.service }} \
-              $ZSTD_PUSH -f services/${{ matrix.service }}/Dockerfile -t $IMAGE .
+              $ZSTD_PUSH "${METADATA_ARGS[@]}" -f services/${{ matrix.service }}/Dockerfile -t "$IMAGE" .
+          fi
+          if [ "$ISOLATED_BUILD" = true ]; then
+            DIGEST=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/identity-build-metadata.json")
+            printf 'private_source=%s\nimage_tag=%s\nimage_digest=%s\n' "$PRIVATE_SOURCE" "$IMAGE" "$DIGEST"
           fi
 
   # ── DEPLOY ───────────────────────────────────────────────────────────────────
@@ -142,6 +197,7 @@ jobs:
   # all services sequentially through it. No concurrent SSH connections.
   deploy:
     needs: [setup, build]
+    if: needs.setup.outputs.isolated_build != 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: deploy
@@ -407,7 +463,7 @@ jobs:
   # builds (no issue) simply skip the report.
   notify:
     needs: [setup, build, deploy]
-    if: always() && github.event.client_payload.issue != ''
+    if: always() && needs.setup.result == 'success' && needs.setup.outputs.isolated_build != 'true' && github.event.client_payload.issue != ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -453,7 +509,7 @@ jobs:
   # ── TEARDOWN ─────────────────────────────────────────────────────────────────
   teardown:
     needs: [setup, deploy]
-    if: always()
+    if: always() && needs.setup.result == 'success' && needs.setup.outputs.isolated_build != 'true' && needs.deploy.result != 'skipped'
     runs-on: ubuntu-latest
     env:
       OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
