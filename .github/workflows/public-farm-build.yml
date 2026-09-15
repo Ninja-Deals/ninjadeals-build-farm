@@ -12,11 +12,11 @@ on:
         required: false
         default: ''
       source_ref:
-        description: 'Full private monorepo commit for isolated Identity, Notification, Discovery, BFF, or Pricing build-only mode.'
+        description: 'Full private monorepo commit for isolated Identity, Deal, Notification, Discovery, BFF, or Pricing build-only mode.'
         required: false
         default: ''
       build_only:
-        description: 'Build only Identity, Notification, Discovery, BFF, or Pricing at source_ref; skip all deployment and OCI jobs.'
+        description: 'Build only Identity, Deal, Notification, Discovery, BFF, or Pricing at source_ref; skip all deployment and OCI jobs.'
         type: boolean
         required: false
         default: false
@@ -50,7 +50,7 @@ jobs:
           isolated=false
           if [ -n "$REQUESTED_SOURCE" ] || [ "$BUILD_ONLY" = true ]; then
             [ "$EVENT_NAME" = workflow_dispatch ]
-            case "$REQUESTED_SERVICES" in identity|notification|discovery|bff|pricing) ;; *) exit 1 ;; esac
+            case "$REQUESTED_SERVICES" in identity|deal|notification|discovery|bff|pricing) ;; *) exit 1 ;; esac
             [ "$BUILD_ONLY" = true ]
             [[ "$REQUESTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
             isolated=true
@@ -152,7 +152,7 @@ jobs:
           if [ "$ISOLATED_BUILD" = true ]; then
             case "${{ matrix.service }}" in
               identity) TAG_PREFIX=ios082 ;;
-              notification) TAG_PREFIX=ios153 ;;
+              deal|notification) TAG_PREFIX=ios153 ;;
               discovery|bff) TAG_PREFIX=ios145 ;;
               pricing) TAG_PREFIX=ios157 ;;
               *) exit 1 ;;
