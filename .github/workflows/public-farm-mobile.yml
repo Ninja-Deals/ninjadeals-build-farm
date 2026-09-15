@@ -130,6 +130,9 @@ jobs:
                   )
               if not artifact_ext:
                   artifact_ext = "aab" if profile == "production" else "apk"
+              if profile == "internal":
+                  size_policy = size_policy or "report"
+                  max_artifact_bytes = max_artifact_bytes or "100000000"
               if profile == "staging":
                   size_policy = size_policy or "enforce"
                   max_artifact_bytes = max_artifact_bytes or "31457280"
