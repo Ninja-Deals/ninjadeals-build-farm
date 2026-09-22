@@ -12,11 +12,11 @@ on:
         required: false
         default: ''
       source_ref:
-        description: 'Full private monorepo commit for isolated Identity, Deal, Notification, Discovery, BFF, or Pricing build-only mode.'
+        description: 'Full private monorepo commit for isolated Identity, Deal, Notification, Discovery, BFF, Pricing, or Frontend build-only mode.'
         required: false
         default: ''
       build_only:
-        description: 'Build only Identity, Deal, Notification, Discovery, BFF, or Pricing at source_ref; skip all deployment and OCI jobs.'
+        description: 'Build only Identity, Deal, Notification, Discovery, BFF, Pricing, or Frontend at source_ref; skip all deployment and OCI jobs.'
         type: boolean
         required: false
         default: false
@@ -50,7 +50,7 @@ jobs:
           isolated=false
           if [ -n "$REQUESTED_SOURCE" ] || [ "$BUILD_ONLY" = true ]; then
             [ "$EVENT_NAME" = workflow_dispatch ]
-            case "$REQUESTED_SERVICES" in identity|deal|notification|discovery|bff|pricing) ;; *) exit 1 ;; esac
+            case "$REQUESTED_SERVICES" in identity|deal|notification|discovery|bff|pricing|frontend) ;; *) exit 1 ;; esac
             [ "$BUILD_ONLY" = true ]
             [[ "$REQUESTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
             isolated=true
@@ -155,6 +155,7 @@ jobs:
               deal|notification) TAG_PREFIX=ios153 ;;
               discovery|bff) TAG_PREFIX=ios145 ;;
               pricing) TAG_PREFIX=ios157 ;;
+              frontend) TAG_PREFIX=frontend ;;
               *) exit 1 ;;
             esac
             IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:${TAG_PREFIX}-${PRIVATE_SOURCE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -182,7 +183,7 @@ jobs:
               --cache-from=type=gha,scope=frontend \
               --cache-to=type=gha,mode=max,scope=frontend \
               --build-arg NEXT_PUBLIC_VAPID_PUBLIC_KEY="${{ secrets.NEXT_PUBLIC_VAPID_PUBLIC_KEY }}" \
-              $ZSTD_PUSH -f frontend/Dockerfile -t $IMAGE frontend/
+              $ZSTD_PUSH "${METADATA_ARGS[@]}" -f frontend/Dockerfile -t $IMAGE frontend/
           elif [ "${{ matrix.service }}" = "ranking" ]; then
             docker buildx build --platform linux/arm64 \
               --cache-from=type=gha,scope=ranking \
