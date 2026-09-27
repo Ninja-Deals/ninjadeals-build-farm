@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths-ignore:
       - '.github/workflows/**'
+      - 'tests/**'
   workflow_dispatch:
     inputs:
       services:
