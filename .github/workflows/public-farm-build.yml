@@ -13,11 +13,11 @@ on:
         required: false
         default: ''
       source_ref:
-        description: 'Full private monorepo commit for isolated Identity, Deal, Notification, Discovery, BFF, Pricing, Frontend, or User Profile build-only mode.'
+        description: 'Full private monorepo commit for isolated Identity, Deal, Notification, Discovery, BFF, Pricing, Frontend, User Profile, or Reputation build-only mode.'
         required: false
         default: ''
       build_only:
-        description: 'Build only Identity, Deal, Notification, Discovery, BFF, Pricing, Frontend, or User Profile at source_ref; skip all deployment and OCI jobs.'
+        description: 'Build only Identity, Deal, Notification, Discovery, BFF, Pricing, Frontend, User Profile, or Reputation at source_ref; skip all deployment and OCI jobs.'
         type: boolean
         required: false
         default: false
@@ -51,7 +51,7 @@ jobs:
           isolated=false
           if [ -n "$REQUESTED_SOURCE" ] || [ "$BUILD_ONLY" = true ]; then
             [ "$EVENT_NAME" = workflow_dispatch ]
-            case "$REQUESTED_SERVICES" in identity|deal|notification|discovery|bff|pricing|frontend|user-profile) ;; *) exit 1 ;; esac
+            case "$REQUESTED_SERVICES" in identity|deal|notification|discovery|bff|pricing|frontend|user-profile|reputation) ;; *) exit 1 ;; esac
             [ "$BUILD_ONLY" = true ]
             [[ "$REQUESTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
             isolated=true
@@ -158,6 +158,7 @@ jobs:
               pricing) TAG_PREFIX=ios157 ;;
               frontend) TAG_PREFIX=frontend ;;
               user-profile) TAG_PREFIX=user-profile ;;
+              reputation) TAG_PREFIX=reputation ;;
               *) exit 1 ;;
             esac
             IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:${TAG_PREFIX}-${PRIVATE_SOURCE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
