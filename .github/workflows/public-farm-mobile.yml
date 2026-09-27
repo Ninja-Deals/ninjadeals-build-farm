@@ -397,6 +397,15 @@ jobs:
           distribution: temurin
           java-version: ${{ needs.resolve.outputs.app_kind == 'native_android' && '21' || '17' }}
 
+      - name: Configure registered native Android internal signing
+        if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android' && needs.resolve.outputs.profile == 'internal'
+        env:
+          NINJADEALS_INTERNAL_KEYSTORE_BASE64: ${{ secrets.NINJADEALS_INTERNAL_KEYSTORE_BASE64 }}
+          NINJADEALS_INTERNAL_KEYSTORE_PASSWORD: ${{ secrets.NINJADEALS_INTERNAL_KEYSTORE_PASSWORD }}
+          NINJADEALS_INTERNAL_KEY_ALIAS: ${{ secrets.NINJADEALS_INTERNAL_KEY_ALIAS }}
+          NINJADEALS_INTERNAL_KEY_PASSWORD: ${{ secrets.NINJADEALS_INTERNAL_KEY_PASSWORD }}
+        run: bash android/scripts/configure-ci-debug-signing.sh
+
       - name: Setup Android SDK
         if: matrix.platform == 'android'
         uses: android-actions/setup-android@v4
@@ -586,6 +595,17 @@ jobs:
             jarsigner -verify -strict "$artifact" >/dev/null
           fi
           printf 'Production AAB policy passed: %s bytes (limit %s, signed=%s).\n' "$actual_bytes" "$MAX_ARTIFACT_BYTES" "$REQUIRE_SIGNED"
+
+      - name: Remove native Android internal signing files
+        if: always() && needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android' && needs.resolve.outputs.profile == 'internal'
+        run: |
+          set -euo pipefail
+          if [[ -n "${NINJA_DEBUG_SIGNING_DIR:-}" ]]; then
+            case "$NINJA_DEBUG_SIGNING_DIR" in
+              "$RUNNER_TEMP"/ninja-debug-signing-*) rm -rf -- "$NINJA_DEBUG_SIGNING_DIR" ;;
+              *) echo 'Unexpected internal signing directory; refusing cleanup.' >&2; exit 1 ;;
+            esac
+          fi
 
       - name: Remove native Android Firebase configuration
         if: always() && needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android'
