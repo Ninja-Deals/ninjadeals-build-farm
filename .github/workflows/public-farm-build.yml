@@ -51,7 +51,7 @@ jobs:
           isolated=false
           if [ -n "$REQUESTED_SOURCE" ] || [ "$BUILD_ONLY" = true ]; then
             [ "$EVENT_NAME" = workflow_dispatch ]
-            case "$REQUESTED_SERVICES" in identity|deal|notification|discovery|bff|pricing|frontend|user-profile|reputation) ;; *) exit 1 ;; esac
+            case "$REQUESTED_SERVICES" in identity|deal|notification|discovery|bff|pricing|frontend|user-profile|reputation|offer) ;; *) exit 1 ;; esac
             [ "$BUILD_ONLY" = true ]
             [[ "$REQUESTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
             isolated=true
@@ -159,6 +159,7 @@ jobs:
               frontend) TAG_PREFIX=frontend ;;
               user-profile) TAG_PREFIX=user-profile ;;
               reputation) TAG_PREFIX=reputation ;;
+              offer) TAG_PREFIX=offer ;;
               *) exit 1 ;;
             esac
             IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:${TAG_PREFIX}-${PRIVATE_SOURCE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
