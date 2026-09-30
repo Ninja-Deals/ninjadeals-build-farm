@@ -60,7 +60,7 @@ jobs:
       - name: Resolve service list
         id: set-matrix
         run: |
-          FULL='["bff","comment","deal","discovery","following","forum","frontend","hello","identity","inbox","indexing-projection","media","moderation","notification","offer","price-collector","price-history","pricing","ranking","reputation","rewards","saved-items","search","user-profile","vote","wallet"]'
+          FULL='["bff","comment","deal","discovery","following","forum","frontend","identity","inbox","indexing-projection","media","moderation","notification","offer","pricing","reputation","saved-items","search","user-profile","vote","wallet"]'
 
           SERVICES_INPUT="${{ inputs.services }}"
           SERVICES_PAYLOAD='${{ toJson(github.event.client_payload.services) }}'
@@ -209,7 +209,8 @@ jobs:
   # all services sequentially through it. No concurrent SSH connections.
   deploy:
     needs: [setup, build]
-    if: needs.setup.outputs.isolated_build != 'true'
+    # Existing hosts are becoming production; legacy staging rollout is opt-in.
+    if: needs.setup.outputs.isolated_build != 'true' && vars.LEGACY_STAGING_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: deploy
@@ -475,7 +476,7 @@ jobs:
   # builds (no issue) simply skip the report.
   notify:
     needs: [setup, build, deploy]
-    if: always() && needs.setup.result == 'success' && needs.setup.outputs.isolated_build != 'true' && github.event.client_payload.issue != ''
+    if: always() && needs.setup.result == 'success' && needs.setup.outputs.isolated_build != 'true' && needs.deploy.result != 'skipped' && github.event.client_payload.issue != ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
