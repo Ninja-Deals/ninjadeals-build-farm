@@ -50,6 +50,7 @@ jobs:
       size_policy: ${{ steps.inputs.outputs.size_policy }}
       max_artifact_bytes: ${{ steps.inputs.outputs.max_artifact_bytes }}
       require_signed: ${{ steps.inputs.outputs.require_signed }}
+      bff_base_url: ${{ steps.inputs.outputs.bff_base_url }}
       matrix: ${{ steps.inputs.outputs.matrix }}
       platforms: ${{ steps.inputs.outputs.platforms }}
       requested_platforms: ${{ steps.inputs.outputs.requested_platforms }}
@@ -74,6 +75,7 @@ jobs:
           SIZE_POLICY_PAYLOAD: ${{ github.event.client_payload.size_policy }}
           MAX_ARTIFACT_BYTES_PAYLOAD: ${{ github.event.client_payload.max_artifact_bytes }}
           REQUIRE_SIGNED_PAYLOAD: ${{ github.event.client_payload.require_signed }}
+          BFF_BASE_URL_PAYLOAD: ${{ github.event.client_payload.bff_base_url }}
           ISSUE_INPUT: ${{ inputs.issue }}
           ISSUE_PAYLOAD: ${{ github.event.client_payload.issue }}
           IOS_BUILDS_PAUSED: ${{ env.IOS_BUILDS_PAUSED }}
@@ -144,7 +146,16 @@ jobs:
                   max_artifact_bytes = max_artifact_bytes or "31457280"
                   require_signed = require_signed or "true"
 
-          else:
+          bff_base_url = first(os.getenv("BFF_BASE_URL_PAYLOAD"), default="")
+          if bff_base_url:
+              if app_kind != "native_android" or profile != "internal":
+                  raise SystemExit("bff_base_url is restricted to native internal qualification")
+              if bff_base_url not in {"https://ninja.deals/", "https://staging.ninja.deals/", "https://test.ninja.deals/"}:
+                  raise SystemExit("bff_base_url must be an owned HTTPS origin")
+          bff_base_url = bff_base_url or "https://staging.ninja.deals/"
+
+          # Native is the maintained mobile root. Legacy handling above remains unchanged.
+          if app_kind != "native_android":
               app_root = "mobile"
 
           if size_policy not in {"", "report", "enforce"}:
@@ -208,6 +219,7 @@ jobs:
               fh.write(f"artifact_ext={artifact_ext}\n")
               fh.write(f"size_policy={size_policy}\n")
               fh.write(f"max_artifact_bytes={max_artifact_bytes}\n")
+              fh.write(f"bff_base_url={bff_base_url}\n")
               fh.write(f"require_signed={'true' if require_signed else 'false'}\n")
               fh.write(f"platforms={','.join(platforms)}\n")
               fh.write(f"requested_platforms={','.join(requested_platforms)}\n")
@@ -247,6 +259,7 @@ jobs:
       NINJADEALS_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.NINJADEALS_RELEASE_KEYSTORE_PASSWORD }}
       NINJADEALS_RELEASE_KEY_ALIAS: ${{ secrets.NINJADEALS_RELEASE_KEY_ALIAS }}
       NINJADEALS_RELEASE_KEY_PASSWORD: ${{ secrets.NINJADEALS_RELEASE_KEY_PASSWORD }}
+      NINJA_INTERNAL_BFF_BASE_URL: ${{ needs.resolve.outputs.bff_base_url }}
       NINJA_PRODUCTION_GOOGLE_SERVER_CLIENT_ID: ${{ secrets.NINJADEALS_PRODUCTION_GOOGLE_SERVER_CLIENT_ID }}
       ANDROID_GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON_BASE64 }}
       CI: '1'
