@@ -160,6 +160,7 @@ jobs:
               user-profile) TAG_PREFIX=user-profile ;;
               reputation) TAG_PREFIX=reputation ;;
               offer) TAG_PREFIX=offer ;;
+              vote) TAG_PREFIX=vote ;;
               *) exit 1 ;;
             esac
             IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:${TAG_PREFIX}-${PRIVATE_SOURCE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
