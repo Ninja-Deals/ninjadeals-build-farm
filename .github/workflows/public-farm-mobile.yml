@@ -572,6 +572,17 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare pinned native Android production bundle inspection
+        if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android' && needs.resolve.outputs.profile == 'production'
+        run: |
+          set -euo pipefail
+          bundletool="$RUNNER_TEMP/bundletool-all-1.18.3.jar"
+          curl --fail --location --retry 3 --output "$bundletool" https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar
+          printf '%s  %s\n' a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29 "$bundletool" | sha256sum -c -
+          printf 'NINJA_BUNDLETOOL_JAR=%s\n' "$bundletool" >> "$GITHUB_ENV"
+          # Upload-key custody fingerprint; Play-delivered APKs use a separate Google-managed signer.
+          printf 'NINJA_PRODUCTION_UPLOAD_CERT_SHA256=%s\n' E18DE30E643F6E377AD0E8CACBC6B3146F952C85A4D6BCE4E6D1C871A13BD15A >> "$GITHUB_ENV"
+
       - name: Build native Android artifact with Gradle
         if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android'
         timeout-minutes: 25
@@ -604,9 +615,10 @@ jobs:
             printf '%s\n' "Production AAB is ${actual_bytes} bytes; limit is ${MAX_ARTIFACT_BYTES} bytes." >&2
             exit 1
           fi
-          if [ "$REQUIRE_SIGNED" = 'true' ]; then
-            jarsigner -verify -strict "$artifact" >/dev/null
-          fi
+          python3 android/scripts/inspect_production_bundle.py "$artifact" \
+            --bundletool "$NINJA_BUNDLETOOL_JAR" \
+            --upload-cert-sha256 "$NINJA_PRODUCTION_UPLOAD_CERT_SHA256" \
+            --max-bytes "$MAX_ARTIFACT_BYTES"
           printf 'Production AAB policy passed: %s bytes (limit %s, signed=%s).\n' "$actual_bytes" "$MAX_ARTIFACT_BYTES" "$REQUIRE_SIGNED"
 
       - name: Remove native Android internal signing files
