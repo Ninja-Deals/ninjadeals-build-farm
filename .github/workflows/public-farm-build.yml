@@ -51,7 +51,7 @@ jobs:
           isolated=false
           if [ -n "$REQUESTED_SOURCE" ] || [ "$BUILD_ONLY" = true ]; then
             [ "$EVENT_NAME" = workflow_dispatch ]
-            case "$REQUESTED_SERVICES" in identity|deal|notification|discovery|bff|pricing|frontend|user-profile|reputation|offer) ;; *) exit 1 ;; esac
+            case "$REQUESTED_SERVICES" in identity|deal|notification|discovery|bff|pricing|frontend|user-profile|reputation|offer|vote) ;; *) exit 1 ;; esac
             [ "$BUILD_ONLY" = true ]
             [[ "$REQUESTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
             isolated=true
