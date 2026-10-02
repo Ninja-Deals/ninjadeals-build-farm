@@ -24,3 +24,10 @@ other operators' sessions occurs. Raw private host plans and credentials are
 never published as artifacts. The job summary contains only source/plan hashes
 and sanitized outcomes. Legacy staging configuration and mutable latest tags are
 not used. This workflow does not deploy native mobile applications.
+
+## Live qualification — 2026-10-02
+
+- [Dummy dry-run](https://github.com/Ninja-Deals/ninjadeals-build-farm/actions/runs/37011751833): setup, frontend build and deploy all passed; workloads were not applied.
+- [Production apply](https://github.com/Ninja-Deals/ninjadeals-build-farm/actions/runs/37012673116): setup, frontend build and deploy all passed; both frontend replicas were updated, retained host readiness and public health checks passed.
+
+Both runs built exact private source `645fb3922e7a1a6743603597594e1478d71f520e` with workflow source `a2bdcec824ccad1597ddfef883200e8cbb5e778e`. Live proof covers the frontend selection. All 22 services are supported by allowlist/Dockerfile validation; a full production rebuild was not performed for this qualification. Existing settings and data were preserved, and no dummy production records were created.
