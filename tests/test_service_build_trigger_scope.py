@@ -29,7 +29,7 @@ class ServiceBuildTriggerScopeTest(unittest.TestCase):
         self.assertTrue(self.push_triggers(['build-service.sh', 'tests/test_native_internal_signing.py']))
         self.assertEqual(['main'], self.triggers['push']['branches'])
         self.assertEqual(['trigger-build'], self.triggers['repository_dispatch']['types'])
-        self.assertEqual({'services', 'source_ref', 'build_only'}, set(self.triggers['workflow_dispatch']['inputs']))
+        self.assertEqual({'services', 'source_ref', 'build_only', 'deployment_mode'}, set(self.triggers['workflow_dispatch']['inputs']))
 
 
 if __name__ == '__main__':

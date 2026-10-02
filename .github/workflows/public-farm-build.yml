@@ -3,24 +3,26 @@ name: Public Farm Build (ARM64)
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '.github/workflows/**'
-      - 'tests/**'
+    paths-ignore: ['.github/workflows/**', 'tests/**', 'docs/**']
   workflow_dispatch:
     inputs:
       services:
-        description: 'Services to build+deploy (comma-separated). Leave empty for all 26.'
+        description: 'Retained production services, comma-separated; empty builds all 22.'
         required: false
         default: ''
       source_ref:
-        description: 'Full private monorepo commit for isolated Identity, Deal, Notification, Discovery, BFF, Pricing, Frontend, User Profile, or Reputation build-only mode.'
+        description: 'Full private monorepo commit; empty resolves main once.'
         required: false
         default: ''
       build_only:
-        description: 'Build only Identity, Deal, Notification, Discovery, BFF, Pricing, Frontend, User Profile, or Reputation at source_ref; skip all deployment and OCI jobs.'
+        description: 'Build immutable images only; intentionally skip production deployment.'
         type: boolean
-        required: false
         default: false
+      deployment_mode:
+        description: 'dry-run prepares and reviews without changing workloads; apply deploys production.'
+        type: choice
+        options: [apply, dry-run]
+        default: apply
   repository_dispatch:
     types: [trigger-build]
 
@@ -29,87 +31,74 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
-  # ── SETUP ───────────────────────────────────────────────────────────────────
-  # Resolve which services to build. No bastion work here.
   setup:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-      services: ${{ steps.set-matrix.outputs.services }}
-      source_ref: ${{ steps.isolated.outputs.source_ref }}
-      isolated_build: ${{ steps.isolated.outputs.isolated_build }}
+      matrix: ${{ steps.request.outputs.matrix }}
+      services: ${{ steps.request.outputs.services }}
+      source_ref: ${{ steps.source.outputs.source_ref }}
+      build_only: ${{ steps.request.outputs.build_only }}
+      deployment_mode: ${{ steps.request.outputs.deployment_mode }}
     steps:
-      - name: Validate isolated service build request
-        id: isolated
+      - name: Validate release request
+        id: request
         env:
-          EVENT_NAME: ${{ github.event_name }}
           REQUESTED_SERVICES: ${{ inputs.services }}
-          REQUESTED_SOURCE: ${{ inputs.source_ref }}
-          BUILD_ONLY: ${{ inputs.build_only }}
+          PAYLOAD_SERVICES: ${{ toJson(github.event.client_payload.services) }}
+          REQUESTED_SOURCE: ${{ inputs.source_ref || github.event.client_payload.source_ref }}
+          BUILD_ONLY: ${{ inputs.build_only || github.event.client_payload.build_only || false }}
+          DEPLOYMENT_MODE: ${{ inputs.deployment_mode || github.event.client_payload.deployment_mode || 'apply' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          allowed = 'bff comment deal discovery following forum frontend identity inbox indexing-projection interaction media moderation notification offer pricing reputation saved-items search user-profile vote wallet'.split()
+          source = os.environ['REQUESTED_SOURCE']
+          if source and not re.fullmatch('[0-9a-f]{40}', source): raise SystemExit('source_ref must be a full lowercase commit SHA')
+          raw = os.environ['REQUESTED_SERVICES']
+          payload = json.loads(os.environ['PAYLOAD_SERVICES'])
+          services = [s.strip() for s in raw.split(',')] if raw else payload if payload is not None else allowed
+          if not isinstance(services, list) or not services or any(not isinstance(s, str) or s not in allowed for s in services) or len(set(services)) != len(services):
+              raise SystemExit('services must be distinct retained production service names')
+          mode = os.environ['DEPLOYMENT_MODE']
+          only = os.environ['BUILD_ONLY']
+          if mode not in ('apply', 'dry-run') or only not in ('true', 'false'): raise SystemExit('invalid release mode')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps({'service': services}, separators=(',', ':')) + '\n')
+              output.write('services=' + ','.join(services) + '\n')
+              output.write('build_only=' + only + '\ndeployment_mode=' + mode + '\n')
+          PY
+      - name: Resolve private source once
+        uses: actions/checkout@v6
+        with:
+          repository: Ninja-Deals/ninjadeals-main
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.source_ref || github.event.client_payload.source_ref || 'main' }}
+          persist-credentials: false
+      - name: Pin exact source
+        id: source
         run: |
           set -euo pipefail
-          isolated=false
-          if [ -n "$REQUESTED_SOURCE" ] || [ "$BUILD_ONLY" = true ]; then
-            [ "$EVENT_NAME" = workflow_dispatch ]
-            case "$REQUESTED_SERVICES" in identity|deal|notification|discovery|bff|pricing|frontend|user-profile|reputation|offer|vote) ;; *) exit 1 ;; esac
-            [ "$BUILD_ONLY" = true ]
-            [[ "$REQUESTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
-            isolated=true
-          fi
-          printf 'isolated_build=%s\nsource_ref=%s\n' "$isolated" "$REQUESTED_SOURCE" >> "$GITHUB_OUTPUT"
-      - name: Resolve service list
-        id: set-matrix
-        run: |
-          FULL='["bff","comment","deal","discovery","following","forum","frontend","identity","inbox","indexing-projection","media","moderation","notification","offer","pricing","reputation","saved-items","search","user-profile","vote","wallet"]'
+          printf 'source_ref=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-          SERVICES_INPUT="${{ inputs.services }}"
-          SERVICES_PAYLOAD='${{ toJson(github.event.client_payload.services) }}'
-
-          if [ -n "$SERVICES_INPUT" ]; then
-            LIST=$(echo "$SERVICES_INPUT" | python3 -c "
-          import sys, json
-          raw = sys.stdin.read().strip()
-          services = [s.strip() for s in raw.split(',') if s.strip()]
-          print(json.dumps(services))
-          ")
-            echo "Manual trigger: $LIST"
-          elif [ -n "$SERVICES_PAYLOAD" ] && [ "$SERVICES_PAYLOAD" != "null" ] && [ "$SERVICES_PAYLOAD" != '""' ]; then
-            LIST=$(echo "$SERVICES_PAYLOAD" | jq -c '.')
-            echo "Repository dispatch: $LIST"
-          else
-            LIST=$FULL
-            echo "Full build: all 26 services"
-          fi
-
-          # matrix for parallel build jobs
-          echo "matrix={\"service\":$LIST}" >> $GITHUB_OUTPUT
-          # space-separated list for the single deploy job
-          echo "services=$(echo $LIST | jq -r '.[]' | tr '\n' ' ')" >> $GITHUB_OUTPUT
-
-  # ── BUILD ────────────────────────────────────────────────────────────────────
-  # All services build in parallel. No bastion, no OCI CLI — just docker buildx.
   build:
     needs: setup
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ needs.setup.outputs.isolated_build == 'true' && 30 || 360 }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
-
     permissions:
       contents: read
       packages: write
-
     steps:
-      - name: Checkout Private Monorepo
+      - name: Checkout pinned private source
         uses: actions/checkout@v6
         with:
-          repository: 'Ninja-Deals/ninjadeals-main'
+          repository: Ninja-Deals/ninjadeals-main
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           ref: ${{ needs.setup.outputs.source_ref }}
-
-      - name: Verify isolated private source checkout
-        if: needs.setup.outputs.isolated_build == 'true'
+          persist-credentials: false
+      - name: Verify private source
         env:
           EXPECTED_SOURCE: ${{ needs.setup.outputs.source_ref }}
         run: |
@@ -117,15 +106,10 @@ jobs:
           [ "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE" ]
           [ -z "$(git status --porcelain)" ]
           printf 'private_source=%s\n' "$EXPECTED_SOURCE"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-qemu-action@v4
         with:
           cache-image: false
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
+      - uses: docker/setup-buildx-action@v4
       - name: Login to Docker Hub
         if: env.DOCKERHUB_USERNAME != ''
         uses: docker/login-action@v4
@@ -134,418 +118,120 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-
       - name: Login to GHCR
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.PRIVATE_REPO_PAT }}
-
       - name: Build and Push ${{ matrix.service }} (ARM64)
         env:
-          ISOLATED_BUILD: ${{ needs.setup.outputs.isolated_build }}
+          SERVICE: ${{ matrix.service }}
           PRIVATE_SOURCE: ${{ needs.setup.outputs.source_ref }}
+          OLA_KEY: ${{ secrets.NEXT_PUBLIC_OLA_MAPS_API_KEY }}
+          VAPID_KEY: ${{ secrets.NEXT_PUBLIC_VAPID_PUBLIC_KEY }}
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:latest"
-          METADATA_ARGS=()
-          if [ "$ISOLATED_BUILD" = true ]; then
-            case "${{ matrix.service }}" in
-              identity) TAG_PREFIX=ios082 ;;
-              deal|notification) TAG_PREFIX=ios153 ;;
-              discovery|bff) TAG_PREFIX=ios145 ;;
-              pricing) TAG_PREFIX=ios157 ;;
-              frontend) TAG_PREFIX=frontend ;;
-              user-profile) TAG_PREFIX=user-profile ;;
-              reputation) TAG_PREFIX=reputation ;;
-              offer) TAG_PREFIX=offer ;;
-              vote) TAG_PREFIX=vote ;;
-              *) exit 1 ;;
-            esac
-            IMAGE="ghcr.io/ninja-deals/ninjadeals-main/${{ matrix.service }}:${TAG_PREFIX}-${PRIVATE_SOURCE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            METADATA_FILE="$RUNNER_TEMP/${{ matrix.service }}-build-metadata.json"
-            METADATA_ARGS=(--metadata-file "$METADATA_FILE")
+          IMAGE="ghcr.io/ninja-deals/ninjadeals-main/$SERVICE:$SERVICE-$PRIVATE_SOURCE-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          METADATA_FILE="$RUNNER_TEMP/$SERVICE-build-metadata.json"
+          EXTRA=()
+          CONTEXT=.
+          DOCKERFILE="services/$SERVICE/Dockerfile"
+          if [ "$SERVICE" = frontend ]; then
+            CONTEXT=frontend/
+            DOCKERFILE=frontend/Dockerfile
+            EXTRA=(--build-arg NEXT_PUBLIC_CAPTCHA_ENABLED=false
+              --build-arg NEXT_PUBLIC_OAUTH_GOOGLE_ENABLED=true
+              --build-arg NEXT_PUBLIC_MFA_ENABLED=false
+              --build-arg NEXT_PUBLIC_GOOGLE_ONLY_AUTH_ENABLED=true
+              --build-arg NEXT_PUBLIC_SENTRY_ENVIRONMENT=production
+              --build-arg NEXT_PUBLIC_OFFERS_V2_ENABLED=true
+              --build-arg "NEXT_PUBLIC_OLA_MAPS_API_KEY=$OLA_KEY"
+              --build-arg "NEXT_PUBLIC_VAPID_PUBLIC_KEY=$VAPID_KEY")
           fi
-          # Push image layers compressed with zstd instead of the default gzip.
-          # The apps-VM deploy is unpack-bound, not network-bound (link does 67-207
-          # MB/s but a single image unpacks at ~8.6 MB/s) — the cost is layer
-          # DECOMPRESSION (single-threaded gzip) + extract. zstd decompresses several
-          # times faster and is multi-threaded, so `docker compose pull` on the VM is
-          # faster; the big images (ranking 585 MB, frontend 341 MB) dominate a full
-          # rebuild and benefit most. force-compression re-encodes CACHED layers too
-          # (e.g. ranking's large, rarely-rebuilt site-packages layer) so they don't
-          # stay gzip on a cache hit. VM has docker 29.5 / containerd 2.2 → full zstd
-          # pull support. Replaces the `--push` shorthand (`type=image,push=true`).
-          ZSTD_PUSH="--output type=image,push=true,compression=zstd,compression-level=3,force-compression=true"
-          if [ "${{ matrix.service }}" = "frontend" ]; then
-            docker buildx build --platform linux/arm64 \
-              --build-arg NEXT_PUBLIC_CAPTCHA_ENABLED=false \
-              --build-arg NEXT_PUBLIC_OAUTH_GOOGLE_ENABLED=true \
-              --build-arg NEXT_PUBLIC_MFA_ENABLED=false \
-              --build-arg NEXT_PUBLIC_GOOGLE_ONLY_AUTH_ENABLED=true \
-              --build-arg NEXT_PUBLIC_SENTRY_ENVIRONMENT=production \
-              --build-arg NEXT_PUBLIC_OFFERS_V2_ENABLED=true \
-              --build-arg NEXT_PUBLIC_OLA_MAPS_API_KEY="${{ secrets.NEXT_PUBLIC_OLA_MAPS_API_KEY }}" \
-              --cache-from=type=gha,scope=frontend \
-              --cache-to=type=gha,mode=max,scope=frontend \
-              --build-arg NEXT_PUBLIC_VAPID_PUBLIC_KEY="${{ secrets.NEXT_PUBLIC_VAPID_PUBLIC_KEY }}" \
-              $ZSTD_PUSH "${METADATA_ARGS[@]}" -f frontend/Dockerfile -t $IMAGE frontend/
-          elif [ "${{ matrix.service }}" = "ranking" ]; then
-            docker buildx build --platform linux/arm64 \
-              --cache-from=type=gha,scope=ranking \
-              --cache-to=type=gha,mode=max,scope=ranking \
-              $ZSTD_PUSH -f services/ranking/Dockerfile -t $IMAGE services/ranking/
-          else
-            docker buildx build --platform linux/arm64 \
-              --cache-from=type=gha,scope=${{ matrix.service }} \
-              --cache-to=type=gha,mode=max,scope=${{ matrix.service }} \
-              $ZSTD_PUSH "${METADATA_ARGS[@]}" -f services/${{ matrix.service }}/Dockerfile -t "$IMAGE" .
-          fi
-          if [ "$ISOLATED_BUILD" = true ]; then
-            DIGEST=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "$METADATA_FILE")
-            printf 'private_source=%s\nimage_tag=%s\nimage_digest=%s\n' "$PRIVATE_SOURCE" "$IMAGE" "$DIGEST"
-          fi
+          docker buildx build --platform linux/arm64 \
+            --cache-from="type=gha,scope=$SERVICE" --cache-to="type=gha,mode=max,scope=$SERVICE" \
+            --output type=image,push=true,compression=zstd,compression-level=3,force-compression=true \
+            --metadata-file "$METADATA_FILE" "${EXTRA[@]}" -f "$DOCKERFILE" -t "$IMAGE" "$CONTEXT"
+          DIGEST=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "$METADATA_FILE")
+          mkdir -p "$RUNNER_TEMP/release"
+          jq -n --arg source_ref "$PRIVATE_SOURCE" --arg service "$SERVICE" \
+            --arg image "ghcr.io/ninja-deals/ninjadeals-main/$SERVICE@$DIGEST" \
+            '{source_ref:$source_ref,service:$service,image:$image}' > "$RUNNER_TEMP/release/$SERVICE.json"
+          printf 'private_source=%s\nimage_tag=%s\nimage_digest=%s\n' "$PRIVATE_SOURCE" "$IMAGE" "$DIGEST"
+      - name: Publish immutable release receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.service }}
+          path: ${{ runner.temp }}/release/${{ matrix.service }}.json
+          if-no-files-found: error
+          retention-days: 14
 
-  # ── DEPLOY ───────────────────────────────────────────────────────────────────
-  # Single job. Opens ONE bastion tunnel after all builds complete, then deploys
-  # all services sequentially through it. No concurrent SSH connections.
   deploy:
     needs: [setup, build]
-    # Existing hosts are becoming production; legacy staging rollout is opt-in.
-    if: needs.setup.outputs.isolated_build != 'true' && vars.LEGACY_STAGING_DEPLOY_ENABLED == 'true'
+    if: needs.setup.outputs.build_only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: production
     concurrency:
-      group: deploy
+      group: production-retained
       cancel-in-progress: false
-
-    env:
-      OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
-      OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
-      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
-      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
-      OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
-      SERVICES: ${{ needs.setup.outputs.services }}
-
-    steps:
-      - name: Checkout Private Monorepo
-        uses: actions/checkout@v6
-        with:
-          repository: 'Ninja-Deals/ninjadeals-main'
-          token: ${{ secrets.PRIVATE_REPO_PAT }}
-
-      - name: Set up OCI CLI
-        uses: oracle-actions/run-oci-cli-command@v1.3.2
-        with:
-          command: 'oci --version'
-
-      - name: Clean up stale bastion sessions
-        run: |
-          # Delete any leftover ACTIVE sessions so we start from a clean slate and
-          # don't bump against the bastion's max-concurrent-session quota (which
-          # itself causes intermittent create-port-forwarding failures). The actual
-          # deploy session is created fresh — and deterministically — in the
-          # "Open Bastion Tunnel" step below; there is no need to pre-create one here.
-          STALE=$(oci bastion session list \
-            --bastion-id ${{ secrets.BASTION_ID }} \
-            --session-lifecycle-state ACTIVE \
-            --query "data[*].id" --raw-output 2>/dev/null || true)
-          for sid in $STALE; do
-            echo "Removing stale session: $sid"
-            oci bastion session delete --session-id "$sid" --force 2>/dev/null || true
-          done
-          [ -n "$STALE" ] && sleep 10 || true
-
-      - name: Open Bastion Tunnel
-        run: |
-          # Use the deploy key for BOTH the bastion hop and the apps-VM login
-          # (mirrors scripts/bastion/ssh-bastion.sh in the monorepo). We create the
-          # session below with this key's public half, so the hop is guaranteed to
-          # present the matching key.
-          if [ -n "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
-            echo "${{ secrets.SSH_PRIVATE_KEY }}" > d_key
-          else
-            cp infra/deploy_ssh_key d_key
-          fi
-          chmod 600 d_key
-          ssh-keygen -y -f d_key > d_key.pub
-
-          # Create a DEDICATED port-forwarding session to the apps VM rather than
-          # reusing an arbitrary active session (the old `--query data[0].id`). With
-          # concurrent sessions (parallel deploys, or a session to the platform VM)
-          # `data[0]` frequently targets a DIFFERENT host, so the tunnel forwarded to
-          # the wrong VM and the "verify apps host is bootstrapped" preflight failed
-          # even though the apps host was perfectly fine. A dedicated session is
-          # deterministic. Apps private IP defaults to 10.0.30.20 (see monorepo
-          # agents-information/docs/INFRA_ACCESS.md); override via secrets.APPS_PRIVATE_IP.
-          APPS_IP="${{ secrets.APPS_PRIVATE_IP }}"
-          APPS_IP="${APPS_IP:-10.0.30.20}"
-          SESSION_ID=$(oci bastion session create-port-forwarding \
-            --bastion-id ${{ secrets.BASTION_ID }} \
-            --display-name "build-farm-deploy-$(date +%s)" \
-            --ssh-public-key-file d_key.pub \
-            --target-private-ip "$APPS_IP" --target-port 22 \
-            --query "data.id" --raw-output)
-          echo "$SESSION_ID" > /tmp/session_id
-
-          echo "Waiting for bastion session $SESSION_ID to become ACTIVE..."
-          for i in {1..45}; do
-            STATE=$(oci bastion session get --session-id "$SESSION_ID" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null || echo UNKNOWN)
-            [ "$STATE" = "ACTIVE" ] && break
-            if [ "$STATE" = "FAILED" ] || [ "$STATE" = "DELETED" ]; then
-              echo "ERROR: bastion session entered state $STATE"; exit 1
-            fi
-            sleep 2
-          done
-
-          SSH_CMD=$(oci bastion session get \
-            --session-id "$SESSION_ID" \
-            --query "data.\"ssh-metadata\".command" --raw-output)
-
-          FINAL=$(echo "$SSH_CMD" \
-            | sed "s|<privateKey>|d_key|g" \
-            | sed "s|<localPort>|2222|g" \
-            | sed "s|ssh |ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o PubkeyAcceptedKeyTypes=+ssh-rsa |")
-
-          # ROOT CAUSE of the flaky "Tunnel failed to establish": OCI Bastion reports
-          # the session lifecycle-state ACTIVE several seconds BEFORE its SSH front-end
-          # actually accepts the session's public key. Connecting inside that window
-          # fails with "Permission denied (publickey)". The old code launched ssh
-          # exactly ONCE and then only polled the local port — so a single early
-          # rejection left a dead process and the deploy failed, even though the key
-          # would have been accepted a few seconds later. (Evidence: runs where ACTIVE
-          # took ~45s succeeded; runs where it flipped in ~11s were denied.)
-          #
-          # Fix: retry the SSH connection ITSELF with backoff until the bastion key has
-          # propagated. nc only confirms the port is up for an attempt that survived.
-          #
-          # SECOND ROOT CAUSE (job hangs after all steps go green): the backgrounded
-          # tunnel inherits this step's stdout/stderr — i.e. the Actions runner's live
-          # log pipe. On success we `exit 0` and leave the tunnel running, so the
-          # orphaned ssh keeps that pipe open and the runner never finalises the job
-          # (deploy stays "in_progress" forever, blocking teardown and leaking bastion
-          # sessions, which then re-fuels the deploy cron's re-dispatch loop). Detaching
-          # the tunnel's three std FDs to a file releases the pipe so the job can end.
-          TUNNEL_PID=""
-          for attempt in $(seq 1 8); do
-            $FINAL </dev/null >>/tmp/tunnel.log 2>&1 &
-            TUNNEL_PID=$!
-            echo "$TUNNEL_PID" > /tmp/tunnel_pid
-            # Give this attempt up to ~10s to bring the local forward up.
-            for i in $(seq 1 5); do
-              if nc -z localhost 2222 2>/dev/null; then
-                echo "Tunnel established to apps VM ($APPS_IP) on attempt $attempt."
-                exit 0
-              fi
-              # If ssh already exited (publickey not yet propagated), stop waiting
-              # on this dead attempt and retry immediately after the backoff below.
-              kill -0 "$TUNNEL_PID" 2>/dev/null || break
-              sleep 2
-            done
-            echo "Attempt $attempt: tunnel not up (bastion key likely still propagating); retrying..."
-            kill "$TUNNEL_PID" 2>/dev/null || true
-            wait "$TUNNEL_PID" 2>/dev/null || true
-            sleep 5
-          done
-          echo "ERROR: Tunnel failed to establish after 8 attempts"
-          exit 1
-
-      - name: Preflight — verify apps host is bootstrapped
-        run: |
-          # The deploy assumes cloud-init seeded /opt/ninjadeals/services/{services.yml,.env}
-          # on first boot. If cloud-init failed (or the VM was recreated and never
-          # re-provisioned), those files are missing and the deploy below dies with a
-          # cryptic "cd: No such file or directory". Fail fast with a fix instead.
-          if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-               -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
-               "test -f /opt/ninjadeals/services/services.yml && test -f /opt/ninjadeals/services/.env"; then
-            echo "Apps host bootstrapped: /opt/ninjadeals/services/{services.yml,.env} present."
-          else
-            echo "::error title=Apps host not bootstrapped::/opt/ninjadeals/services/{services.yml,.env} missing on 10.0.30.20"
-            echo "::error::The apps VM cloud-init did not seed the compose dir (likely failed on first boot, or the VM was recreated)."
-            echo "::error::Bootstrap it once, then re-run this deploy. Either:"
-            echo "::error::  (a) re-provision so the fixed cloud-init runs fresh:  cd infra && tofu taint oci_core_instance.apps && tofu apply"
-            echo "::error::  (b) seed the running host by hand: create /opt/ninjadeals/services, copy infra/compose/services.yml there, and write .env via /usr/local/bin/fetch_secret.sh (see scripts/deploy/deploy.sh in the monorepo)."
-            exit 1
-          fi
-
-      - name: Sync compose file from monorepo to host
-        run: |
-          # The host's /opt/ninjadeals/services/services.yml was only ever seeded by
-          # cloud-init and then drifted from git — so monorepo changes to the compose
-          # config (e.g. IDENTITY_CAPTCHA_ENABLED defaults, new env vars) never reached
-          # staging via this deploy. Push the checked-out monorepo copy on every deploy so
-          # git is the single source of truth for compose config. Runtime secrets stay in
-          # the host .env (untouched here). `up -d` below re-reads both.
-          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o IdentitiesOnly=yes -i d_key -P 2222 \
-            infra/compose/services.yml opc@127.0.0.1:/tmp/services.yml
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
-            "sudo cp /tmp/services.yml /opt/ninjadeals/services/services.yml && rm -f /tmp/services.yml"
-          echo "services.yml synced from monorepo to host."
-
-      - name: Deploy All Services
-        run: |
-          # frontend-2 shares the frontend image but is a separate container not in the
-          # build matrix — always include it alongside frontend so both replicas are updated.
-          DEPLOY_SERVICES=$(echo "$SERVICES" | sed 's/\bfrontend\b/frontend frontend-2/g')
-          echo "Deploying: $DEPLOY_SERVICES"
-          # flock (fd 9 on /tmp/ninja-deploy.lock) serialises this prune+pull+up against
-          # ANY other deploy hitting the same Apps VM — a concurrent deploy.sh run, or a
-          # second build-farm deploy. Without it, two `docker compose pull`s race on the
-          # one docker daemon and the shared cross-cloud ghcr.io pipe; the daemon de-dups
-          # concurrent pulls of the same ref so they end up serialising anyway, but only
-          # after each has crawled — a deploy that's 1-2 min uncontended balloons to 15-20.
-          # The lock makes concurrent deploys QUEUE. deploy.sh in the monorepo flocks this
-          # SAME path. opc owns the lock file (no sudo on the exec, so the fd always opens);
-          # it auto-releases when this ssh session's fd 9 closes. -w 1200 waits up to 20 min.
-          #
-          # `docker image prune -f` reclaims ALL dangling layers (old :latest versions
-          # orphaned by every deploy). The previous `-af --filter until=24h` reclaimed
-          # NOTHING on a repo that deploys many times/day (every dangling layer <24h old),
-          # so the apps-VM disk crept toward full. Plain `-f` (dangling only, any age)
-          # never touches a tagged or in-use image.
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o IdentitiesOnly=yes -i d_key -p 2222 opc@127.0.0.1 \
-            "bash -s -- '$DEPLOY_SERVICES'" <<'REMOTE'
-          set -euo pipefail
-          DEPLOY_SERVICES="$1"
-          COMPOSE='sudo docker compose -f services.yml'
-
-          exec 9>/tmp/ninja-deploy.lock
-          flock -w 1200 9 || { echo 'deploy-lock: timed out waiting for a concurrent deploy to release the lock'; exit 1; }
-          sudo docker image prune -f 2>/dev/null || true
-          cd /opt/ninjadeals/services
-          $COMPOSE pull --quiet $DEPLOY_SERVICES
-
-          NON_FRONTEND_SERVICES=''
-          for svc in $DEPLOY_SERVICES; do
-            case "$svc" in
-              frontend|frontend-2) ;;
-              *) NON_FRONTEND_SERVICES="$NON_FRONTEND_SERVICES $svc" ;;
-            esac
-          done
-          if [ -n "${NON_FRONTEND_SERVICES// }" ]; then
-            $COMPOSE up -d $NON_FRONTEND_SERVICES
-          fi
-
-          # Do not recreate both frontend replicas together. That leaves the OCI
-          # load balancer with no Node target and makes visitors see a 502 during
-          # an otherwise healthy rollout. Keep one old replica serving while its
-          # sibling is recreated, and wait for the host-published health endpoint
-          # before touching the next replica.
-          for svc in frontend frontend-2; do
-            case " $DEPLOY_SERVICES " in
-              *" $svc "*) ;;
-              *) continue ;;
-            esac
-            echo "Rolling $svc..."
-            $COMPOSE up -d --no-deps --force-recreate "$svc"
-            FRONTEND_CODE=000
-            for attempt in $(seq 1 12); do
-              PORT=$(sudo docker port "$svc" 3000/tcp 2>/dev/null | head -n1 | sed 's/.*://')
-              if [ -n "$PORT" ] && curl --connect-timeout 2 -m 5 -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/healthz" | grep -qx 200; then
-                FRONTEND_CODE=200
-                break
-              fi
-              sleep 5
-            done
-            [ "$FRONTEND_CODE" = 200 ] || { echo "$svc did not become ready (/healthz: $FRONTEND_CODE)"; exit 1; }
-            echo "$svc is ready."
-          done
-          REMOTE
-          echo "All services deployed."
-
-      - name: Close Tunnel
-        if: always()
-        run: |
-          # Kill the recorded tunnel pid, then sweep any stragglers by the unique
-          # local-forward pattern so no ssh child survives to hold the job's log
-          # pipe open (which would hang job finalisation even with FDs detached).
-          kill "$(cat /tmp/tunnel_pid 2>/dev/null)" 2>/dev/null || true
-          pkill -f 'ssh .*-L 2222:' 2>/dev/null || true
-          # Never let cleanup fail the job.
-          exit 0
-
-  # ── NOTIFY ───────────────────────────────────────────────────────────────────
-  # Report the deploy outcome back to the orchestrator by labelling the issue in
-  # the private monorepo (deploy:success / deploy:failed). The orchestrator reacts
-  # via the GitHub webhook it already receives — this routes around the Cloudflare
-  # Bot Fight Mode challenge that blocks a direct POST. On failure the complete
-  # error log is posted as an issue comment so the issue can be re-fixed.
-  #
-  # Driven off the repository_dispatch client_payload.issue, so manual / push
-  # builds (no issue) simply skip the report.
-  notify:
-    needs: [setup, build, deploy]
-    if: always() && needs.setup.result == 'success' && needs.setup.outputs.isolated_build != 'true' && needs.deploy.result != 'skipped' && github.event.client_payload.issue != ''
-    runs-on: ubuntu-latest
     permissions:
       contents: read
       actions: read
-    steps:
-      - name: Report deploy result to the issue
-        env:
-          # PAT with access to the private monorepo (same token used for checkout).
-          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
-          REPO: Ninja-Deals/ninjadeals-main
-          ISSUE: ${{ github.event.client_payload.issue }}
-          BUILD_RESULT: ${{ needs.build.result }}
-          DEPLOY_RESULT: ${{ needs.deploy.result }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-
-          add_label() {  # add a label to the issue (label is pre-created in the repo)
-            gh api "repos/$REPO/issues/$ISSUE/labels" -X POST -f "labels[]=$1" >/dev/null
-          }
-          comment() { gh api "repos/$REPO/issues/$ISSUE/comments" -X POST -f body="$1" >/dev/null; }
-
-          if [ "$BUILD_RESULT" = "success" ] && [ "$DEPLOY_RESULT" = "success" ]; then
-            echo "Deploy succeeded for issue #$ISSUE"
-            comment "🚀 Build-farm deploy to \`staging\` succeeded. ${RUN_URL}"
-            add_label "deploy:success"
-          else
-            echo "Deploy failed for issue #$ISSUE — gathering logs"
-            LOG=""
-            JOBS=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100")
-            for jid in $(echo "$JOBS" | jq -r '.jobs[] | select(.conclusion=="failure") | .id'); do
-              JLOG=$(gh api "repos/${{ github.repository }}/actions/jobs/${jid}/logs" 2>/dev/null || true)
-              LOG="${LOG}
-          ===== failed job ${jid} =====
-          ${JLOG}"
-            done
-            LOG=$(printf '%s' "$LOG" | tail -c 30000)
-            comment "$(printf '%s\n\n%s\n\n```\n%s\n```' '❌ Build-farm deploy **failed** — staying at `status:done`, flagging for human review.' "$RUN_URL" "$LOG")"
-            add_label "deploy:failed"
-          fi
-
-  # ── TEARDOWN ─────────────────────────────────────────────────────────────────
-  teardown:
-    needs: [setup, deploy]
-    if: always() && needs.setup.result == 'success' && needs.setup.outputs.isolated_build != 'true' && needs.deploy.result != 'skipped'
-    runs-on: ubuntu-latest
     env:
       OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
       OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
       OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
       OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
       OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
+      BASTION_ID: ${{ secrets.BASTION_ID }}
+      PRIVATE_SOURCE: ${{ needs.setup.outputs.source_ref }}
+      DEPLOYMENT_MODE: ${{ needs.setup.outputs.deployment_mode }}
+      SELECTED_SERVICES: ${{ needs.setup.outputs.services }}
     steps:
+      - name: Checkout pinned private source
+        uses: actions/checkout@v6
+        with:
+          repository: Ninja-Deals/ninjadeals-main
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ needs.setup.outputs.source_ref }}
+          persist-credentials: false
+      - name: Verify deploy source
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$PRIVATE_SOURCE" ]
+          [ -z "$(git status --porcelain)" ]
+      - name: Download this run's immutable receipts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/release
+      - name: Verify production deployment preservation contracts
+        run: python3 -m unittest discover -s scripts/deploy -p 'test_production_*.py'
       - name: Set up OCI CLI
         uses: oracle-actions/run-oci-cli-command@v1.3.2
         with:
           command: 'oci --version'
-
-      - name: Delete Bastion Session
+      - name: Materialize existing deploy key
+        env:
+          DEPLOY_KEY_CONTENT: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
-          SESSIONS=$(oci bastion session list \
-            --bastion-id ${{ secrets.BASTION_ID }} \
-            --session-lifecycle-state ACTIVE \
-            --query "data[*].id" --raw-output 2>/dev/null || true)
-          for sid in $SESSIONS; do
-            echo "Deleting: $sid"
-            oci bastion session delete --session-id "$sid" --force || true
-          done
+          set -euo pipefail
+          umask 077
+          [ -n "$DEPLOY_KEY_CONTENT" ]
+          SSH_KEY="$RUNNER_TEMP/production-deploy-key"
+          printf '%s\n' "$DEPLOY_KEY_CONTENT" > "$SSH_KEY"
+          ssh-keygen -y -f "$SSH_KEY" > "$SSH_KEY.pub"
+          printf 'SSH_KEY=%s\n' "$SSH_KEY" >> "$GITHUB_ENV"
+      - name: Prepare, review and deploy retained production
+        run: |
+          set -euo pipefail
+          python3 scripts/deploy/production_actions.py deploy \
+            --receipts "$RUNNER_TEMP/release" --source "$PRIVATE_SOURCE" --services "$SELECTED_SERVICES" \
+            --plan-id "farm-production-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --mode "$DEPLOYMENT_MODE"
+      - name: Remove owned temporary key
+        if: always()
+        run: |
+          rm -f -- "$RUNNER_TEMP/production-deploy-key" "$RUNNER_TEMP/production-deploy-key.pub"
