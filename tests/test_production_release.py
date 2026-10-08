@@ -39,6 +39,20 @@ class ProductionReleaseTest(unittest.TestCase):
             self.assertEqual(mode, data['deployment_mode'])
             self.assertEqual(only, data['build_only'])
 
+    def test_earnings_is_explicit_pinned_build_only_enrollment(self):
+        result, data = self.validate(REQUESTED_SERVICES='earnings', BUILD_ONLY='true', DEPLOYMENT_MODE='dry-run')
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual('earnings', data['services'])
+        for overrides in ({'BUILD_ONLY':'false'}, {'REQUESTED_SOURCE':''}, {'REQUESTED_SOURCE':'main'}):
+            args = {'REQUESTED_SERVICES':'earnings', 'BUILD_ONLY':'true', 'DEPLOYMENT_MODE':'dry-run'}
+            args.update(overrides)
+            result, data = self.validate(**args)
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual({}, data)
+        result, data = self.validate(REQUESTED_SERVICES='', BUILD_ONLY='true')
+        self.assertEqual(22, len(json.loads(data['matrix'])['service']))
+        self.assertNotIn('earnings', data['services'])
+
     def test_all_retained_services_and_subsets_are_accepted(self):
         result, data = self.validate(REQUESTED_SERVICES='', REQUESTED_SOURCE='')
         self.assertEqual(0, result.returncode, result.stderr)
@@ -113,7 +127,7 @@ class ProductionReleaseTest(unittest.TestCase):
         jq_dir = Path('C:/Users/yuvar/.cache/ninja-back-tools')
         if not bash: self.skipTest('bash unavailable')
         script = next(s['run'] for s in self.jobs['build']['steps'] if s.get('name','').startswith('Build and Push'))
-        for service in ('frontend', 'interaction', 'reputation'):
+        for service in ('frontend', 'interaction', 'reputation', 'earnings'):
             with self.subTest(service=service), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 docker = root / 'docker'

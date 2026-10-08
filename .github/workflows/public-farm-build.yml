@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       services:
-        description: 'Retained production services, comma-separated; empty builds all 22.'
+        description: 'Retained services; empty builds 22. Earnings requires explicit pinned build-only enrollment.'
         required: false
         default: ''
       source_ref:
@@ -57,11 +57,14 @@ jobs:
           raw = os.environ['REQUESTED_SERVICES']
           payload = json.loads(os.environ['PAYLOAD_SERVICES'])
           services = [s.strip() for s in raw.split(',')] if raw else payload if payload is not None else allowed
-          if not isinstance(services, list) or not services or any(not isinstance(s, str) or s not in allowed for s in services) or len(set(services)) != len(services):
+          build_allowed = allowed + ['earnings']
+          if not isinstance(services, list) or not services or any(not isinstance(s, str) or s not in build_allowed for s in services) or len(set(services)) != len(services):
               raise SystemExit('services must be distinct retained production service names')
           mode = os.environ['DEPLOYMENT_MODE']
           only = os.environ['BUILD_ONLY']
           if mode not in ('apply', 'dry-run') or only not in ('true', 'false'): raise SystemExit('invalid release mode')
+          if 'earnings' in services and (only != 'true' or not source):
+              raise SystemExit('earnings requires explicit full source_ref and build_only=true; enroll separately')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('matrix=' + json.dumps({'service': services}, separators=(',', ':')) + '\n')
               output.write('services=' + ','.join(services) + '\n')
