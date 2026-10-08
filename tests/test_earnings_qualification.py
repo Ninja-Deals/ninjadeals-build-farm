@@ -18,7 +18,7 @@ class EarningsQualificationWorkflowTests(unittest.TestCase):
         self.assertFalse(checkout['with']['persist-credentials'])
         self.assertEqual(checkout['with']['ref'],'${{ inputs.source_ref }}')
         upload=job['steps'][-1]
-        self.assertEqual(upload['with']['path'],'evidence/qualification.json')
+        self.assertEqual(set(upload['with']['path'].splitlines()),{'evidence/qualification.json','evidence/browser-summary.json','evidence/synthetic-*.png'})
         self.assertNotIn('compose.json',upload['with']['path'])
 
 if __name__=='__main__':unittest.main()
