@@ -62,6 +62,8 @@ jobs:
            "tests/web-e2e/playwright.creator-earnings-ci.config.ts",
            "tests/web-e2e/creator-earnings/safe-reporter.ts", "tests/web-e2e/creator-earnings/safe-reporter.unit.mjs",
            "tests/web-e2e/creator-earnings/money.isolated.spec.ts",
+           "tests/web-e2e/creator-earnings/financial.isolated.spec.ts",
+           "tests/web-e2e/creator-earnings/coverage.isolated.spec.ts",
            "tests/web-e2e/creator-earnings/creator-earnings.spec.ts",
            "tests/web-e2e/creator-earnings/isolated-fixture.ts",
            "scripts/ops/EARNINGS_ENROLLMENT_PROFILE.md",

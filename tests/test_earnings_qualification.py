@@ -40,6 +40,8 @@ class EarningsQualificationWorkflowTests(unittest.TestCase):
         tree=ast.parse(code);tree.body=tree.body[:-1]
         namespace={};exec(compile(tree,'trusted-farm-guard','exec'),namespace)
         verify=namespace['verify_harness_revision']
+        self.assertTrue({'tests/web-e2e/creator-earnings/financial.isolated.spec.ts','tests/web-e2e/creator-earnings/coverage.isolated.spec.ts'} <= namespace['HARNESS_ONLY_PATHS'])
+        self.assertNotIn('tests/web-e2e/creator-earnings/arbitrary.isolated.spec.ts',namespace['HARNESS_ONLY_PATHS'])
         with tempfile.TemporaryDirectory() as d:
             repo=Path(d)
             def git(*args):return subprocess.check_output(['git','-C',str(repo),*args],text=True).strip()
