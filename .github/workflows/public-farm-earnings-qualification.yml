@@ -7,6 +7,9 @@ on:
       source_ref:
         description: 'Full monorepo source SHA matching all 23 immutable build receipts'
         required: true
+      harness_ref:
+        description: 'Optional full reviewed test-only descendant SHA; application changes are rejected'
+        required: false
       build_run_id:
         description: 'Successful build-only farm run containing release artifacts for all 23 apps'
         required: true
@@ -24,21 +27,63 @@ jobs:
       - name: Validate immutable qualification inputs
         env:
           SOURCE: ${{ inputs.source_ref }}
+          HARNESS: ${{ inputs.harness_ref || inputs.source_ref }}
           BUILD_RUN: ${{ inputs.build_run_id }}
         run: |
           python3 - <<'PY'
           import os,re
           if not re.fullmatch('[0-9a-f]{40}',os.environ['SOURCE']): raise SystemExit('Full source SHA required')
+          if not re.fullmatch('[0-9a-f]{40}',os.environ['HARNESS']): raise SystemExit('Full harness SHA required')
           if not re.fullmatch('[1-9][0-9]{0,19}',os.environ['BUILD_RUN']): raise SystemExit('Exact build run ID required')
           PY
       - name: Checkout exact private source
         uses: actions/checkout@v6
         with:
           repository: Ninja-Deals/ninjadeals-main
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ inputs.harness_ref || inputs.source_ref }}
+          fetch-depth: 0
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           persist-credentials: false
           path: source
+      - name: Prove unchanged application before source execution
+        env:
+          SOURCE: ${{ inputs.source_ref }}
+          HARNESS: ${{ inputs.harness_ref || inputs.source_ref }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          SHA = re.compile(r"[0-9a-f]{40}")
+          # Reviewed test/operations-only changes may qualify the SAME immutable app images.
+          # Everything else, including root build inputs and cmd/, requires new images.
+          HARNESS_ONLY_PATHS = frozenset({
+           "scripts/test/earnings_ci.py", "scripts/test/test_earnings_ci.py", "scripts/test/earnings_revision.py",
+           "scripts/test/dispatch_earnings_ci.py",
+           "tests/web-e2e/playwright.creator-earnings-ci.config.ts",
+           "tests/web-e2e/creator-earnings/safe-reporter.ts", "tests/web-e2e/creator-earnings/safe-reporter.unit.mjs",
+           "tests/web-e2e/creator-earnings/money.isolated.spec.ts",
+           "tests/web-e2e/creator-earnings/creator-earnings.spec.ts",
+           "tests/web-e2e/creator-earnings/isolated-fixture.ts",
+           "scripts/ops/EARNINGS_ENROLLMENT_PROFILE.md",
+           "scripts/ops/earnings_enrollment_profile.py",
+           "scripts/ops/test_earnings_enrollment_profile.py",
+           "agents-information/plans/2026-10-08-creator-earnings/deployment-review-73e3a54.md",
+          })
+
+          def verify_harness_revision(repo, source, harness):
+           if not SHA.fullmatch(source) or not SHA.fullmatch(harness):raise ValueError("immutable app and harness SHAs required")
+           def git(*args):return subprocess.run(["git","-C",str(repo),*args],capture_output=True,check=False)
+           head=git("rev-parse","HEAD")
+           if head.returncode or head.stdout.decode().strip()!=harness:raise ValueError("checkout differs from immutable harness")
+           if git("diff","--quiet","HEAD","--").returncode:raise ValueError("tracked harness worktree must be clean")
+           if git("merge-base","--is-ancestor",source,harness).returncode:raise ValueError("application source must be a harness ancestor")
+           diff=git("diff","--name-only","--no-renames","-z",source,harness,"--")
+           if diff.returncode:raise ValueError("cannot prove unchanged application tree")
+           paths=sorted(filter(None,diff.stdout.decode("utf-8",errors="strict").split("\0")))
+           if any(path not in HARNESS_ONLY_PATHS for path in paths):raise ValueError("harness revision changes application or unapproved paths")
+           return {"app_source_ref":source,"harness_ref":harness,"app_source_is_ancestor":True,"tracked_worktree_clean":True,"allowed_nonapp_changes":paths}
+          print(json.dumps(verify_harness_revision(Path("source"),os.environ["SOURCE"],os.environ["HARNESS"]),sort_keys=True))
+          PY
       - name: Obtain immutable release receipts
         uses: actions/download-artifact@v5
         with:
@@ -71,6 +116,7 @@ jobs:
       - name: Run fresh isolated services and real browser journeys
         env:
           SOURCE: ${{ inputs.source_ref }}
+          HARNESS: ${{ inputs.harness_ref || inputs.source_ref }}
         run: |
           set -euo pipefail
           PYTHON_BIN=$(command -v python)
@@ -79,7 +125,7 @@ jobs:
             GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_EVENT_NAME=workflow_dispatch RUNNER_ENVIRONMENT=github-hosted \
             PATH="$PATH" DOCKER_CONFIG="$HOME/.docker" \
             "$PYTHON_BIN" source/scripts/test/earnings_ci.py \
-            --source "$SOURCE" --receipts "$GITHUB_WORKSPACE/receipts" \
+            --source "$SOURCE" --harness-ref "$HARNESS" --receipts "$GITHUB_WORKSPACE/receipts" \
             --output "$GITHUB_WORKSPACE/evidence" --node "$NODE_BIN" \
             --browsers "$RUNNER_TEMP/earnings-browsers"
       - name: Upload sanitized qualification receipt
