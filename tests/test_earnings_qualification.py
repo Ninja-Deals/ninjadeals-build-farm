@@ -3,6 +3,9 @@ import unittest
 import ast
 import tempfile
 import subprocess
+import json
+import os
+from unittest.mock import patch
 import yaml
 
 class EarningsQualificationWorkflowTests(unittest.TestCase):
@@ -32,6 +35,49 @@ class EarningsQualificationWorkflowTests(unittest.TestCase):
         upload=job['steps'][-1]
         self.assertEqual(set(upload['with']['path'].splitlines()),{'evidence/qualification.json','evidence/browser-summary.json','evidence/synthetic-*.png'})
         self.assertNotIn('compose.json',upload['with']['path'])
+
+    def test_export_race_job_is_immutable_disposable_and_redacted(self):
+        workflow=yaml.safe_load(Path('.github/workflows/public-farm-earnings-qualification.yml').read_text())
+        job=workflow['jobs']['go-race']
+        self.assertEqual(job['runs-on'],'ubuntu-24.04')
+        self.assertEqual(job['timeout-minutes'],30)
+        steps=job['steps']
+        checkout=next(s for s in steps if s.get('uses','').startswith('actions/checkout@'))
+        self.assertEqual(checkout['with']['ref'],'${{ inputs.source_ref }}')
+        self.assertFalse(checkout['with']['persist-credentials'])
+        run=next(s for s in steps if s.get('name')=='Run Docker export package and Earnings race tests')
+        self.assertEqual(run['env']['CGO_ENABLED'],'1')
+        self.assertIn('-race',run['run'])
+        self.assertIn('./services/user-profile/internal/export',run['run'])
+        self.assertIn('./services/earnings/...',run['run'])
+        self.assertIn('stdout=raw,stderr=subprocess.STDOUT',run['run'])
+        self.assertNotIn('print(raw',run['run'])
+        self.assertNotIn('continue-on-error',job)
+        upload=steps[-1]
+        self.assertEqual(upload['with']['path'],'go-evidence/race-summary.json')
+
+    def test_race_receipt_never_exports_output_and_fails_on_skip(self):
+        workflow=yaml.safe_load(Path('.github/workflows/public-farm-earnings-qualification.yml').read_text())
+        raw=next(s['run'] for s in workflow['jobs']['go-race']['steps'] if s.get('name')=='Run Docker export package and Earnings race tests')
+        code=raw.split("python3 - <<'PY'\n",1)[1].rsplit('\nPY',1)[0]
+        for action,want in [('pass',0),('fail',1),('skip',1)]:
+            with tempfile.TemporaryDirectory() as d:
+                def run(args,**kwargs):
+                    output=kwargs['stdout']
+                    for event in [{'Action':'output','Output':'PRIVATE_SECRET_SENTINEL'}, {'Action':action,'Test':'PrivateTestName'}, {'Action':'pass'}]:
+                        output.write((json.dumps(event)+'\n').encode())
+                    return subprocess.CompletedProcess(args,0)
+                original=os.getcwd()
+                try:
+                    os.chdir(d)
+                    with patch('subprocess.run',side_effect=run),patch.dict(os.environ,{'SOURCE':'a'*40}),patch('builtins.print'):
+                        with self.assertRaises(SystemExit) as raised:exec(compile(code,'trusted-race-summary','exec'),{})
+                    self.assertEqual(raised.exception.code,want)
+                    content=Path('go-evidence/race-summary.json').read_text()
+                    self.assertNotIn('PRIVATE_SECRET_SENTINEL',content)
+                    self.assertNotIn('PrivateTestName',content)
+                    self.assertEqual(json.loads(content)['success'],want==0)
+                finally:os.chdir(original)
 
     def test_trusted_inline_guard_rejects_application_changes_before_imports(self):
         workflow=yaml.safe_load(Path('.github/workflows/public-farm-earnings-qualification.yml').read_text())

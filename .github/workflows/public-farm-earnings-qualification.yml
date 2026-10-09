@@ -143,3 +143,76 @@ jobs:
             evidence/synthetic-*.png
           if-no-files-found: warn
           retention-days: 14
+  go-race:
+    if: github.repository == 'Ninja-Deals/ninjadeals-build-farm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Validate immutable application source
+        env:
+          SOURCE: ${{ inputs.source_ref }}
+        run: |
+          python3 - <<'PY'
+          import os,re
+          if not re.fullmatch('[0-9a-f]{40}',os.environ['SOURCE']): raise SystemExit('Full source SHA required')
+          PY
+      - uses: actions/checkout@v6
+        with:
+          repository: Ninja-Deals/ninjadeals-main
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: source
+          persist-credentials: false
+      - name: Verify exact source checkout before execution
+        env:
+          SOURCE: ${{ inputs.source_ref }}
+        run: |
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE"
+          git -C source diff --quiet HEAD --
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: source/go.work
+          cache-dependency-path: source/go.work.sum
+      - name: Run Docker export package and Earnings race tests
+        env:
+          SOURCE: ${{ inputs.source_ref }}
+          CGO_ENABLED: '1'
+        run: |
+          python3 - <<'PY'
+          import json,os,subprocess,tempfile
+          from pathlib import Path
+          groups=[('user-profile-export','./services/user-profile/internal/export'),('earnings-unit','./services/earnings/...')]
+          results=[]
+          for name,package in groups:
+            with tempfile.TemporaryFile(mode='w+b') as raw:
+              timed_out=False
+              try:
+                result=subprocess.run(['go','test','-race','-json','-count=1','-timeout=10m',package],cwd='source',stdout=raw,stderr=subprocess.STDOUT,timeout=750)
+                code=result.returncode
+              except subprocess.TimeoutExpired:
+                code=124;timed_out=True
+              raw.seek(0)
+              counts={'pass':0,'fail':0,'skip':0}
+              packages={'pass':0,'fail':0,'skip':0}
+              for line in raw:
+                try: event=json.loads(line)
+                except (ValueError,UnicodeError): continue
+                action=event.get('Action')
+                if action in counts:
+                  bucket=counts if event.get('Test') else packages
+                  bucket[action]+=1
+              results.append({'group':name,'package':package,'exitCode':code,'timedOut':timed_out,'tests':counts,'packages':packages})
+          success=all(r['exitCode']==0 and r['tests']['pass']>0 and r['tests']['fail']==0 and r['tests']['skip']==0 and r['packages']['fail']==0 and r['packages']['skip']==0 for r in results)
+          out=Path('go-evidence');out.mkdir()
+          (out/'race-summary.json').write_text(json.dumps({'source_ref':os.environ['SOURCE'],'success':success,'race':True,'cgo':True,'dockerExportPackage':True,'taggedIntegrationIncluded':False,'results':results},sort_keys=True))
+          print('Source-bound race verification passed' if success else 'Source-bound race verification failed; see sanitized counts')
+          raise SystemExit(0 if success else 1)
+          PY
+      - name: Upload sanitized race verification receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: earnings-race-${{ inputs.source_ref }}
+          path: go-evidence/race-summary.json
+          if-no-files-found: warn
+          retention-days: 14
