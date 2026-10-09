@@ -202,7 +202,8 @@ jobs:
                   bucket=counts if event.get('Test') else packages
                   bucket[action]+=1
               results.append({'group':name,'package':package,'exitCode':code,'timedOut':timed_out,'tests':counts,'packages':packages})
-          success=all(r['exitCode']==0 and r['tests']['pass']>0 and r['tests']['fail']==0 and r['tests']['skip']==0 and r['packages']['fail']==0 and r['packages']['skip']==0 for r in results)
+          # Go emits package skip for packages without test files; only test skips are omissions.
+          success=all(r['exitCode']==0 and r['tests']['pass']>0 and r['tests']['fail']==0 and r['tests']['skip']==0 and r['packages']['fail']==0 for r in results)
           out=Path('go-evidence');out.mkdir()
           (out/'race-summary.json').write_text(json.dumps({'source_ref':os.environ['SOURCE'],'success':success,'race':True,'cgo':True,'dockerExportPackage':True,'taggedIntegrationIncluded':False,'results':results},sort_keys=True))
           print('Source-bound race verification passed' if success else 'Source-bound race verification failed; see sanitized counts')

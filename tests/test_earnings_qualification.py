@@ -60,11 +60,11 @@ class EarningsQualificationWorkflowTests(unittest.TestCase):
         workflow=yaml.safe_load(Path('.github/workflows/public-farm-earnings-qualification.yml').read_text())
         raw=next(s['run'] for s in workflow['jobs']['go-race']['steps'] if s.get('name')=='Run Docker export package and Earnings race tests')
         code=raw.split("python3 - <<'PY'\n",1)[1].rsplit('\nPY',1)[0]
-        for action,want in [('pass',0),('fail',1),('skip',1)]:
+        for action,want in [('pass',0),('fail',1),('skip',1),('package-without-tests',0)]:
             with tempfile.TemporaryDirectory() as d:
                 def run(args,**kwargs):
                     output=kwargs['stdout']
-                    for event in [{'Action':'output','Output':'PRIVATE_SECRET_SENTINEL'}, {'Action':action,'Test':'PrivateTestName'}, {'Action':'pass'}]:
+                    for event in [{'Action':'output','Output':'PRIVATE_SECRET_SENTINEL'}, {'Action':'pass' if action=='package-without-tests' else action,'Test':'PrivateTestName'}, {'Action':'skip' if action=='package-without-tests' else 'pass'}]:
                         output.write((json.dumps(event)+'\n').encode())
                     return subprocess.CompletedProcess(args,0)
                 original=os.getcwd()
