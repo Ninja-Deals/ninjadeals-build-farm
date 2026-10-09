@@ -88,6 +88,7 @@ class EarningsQualificationWorkflowTests(unittest.TestCase):
         verify=namespace['verify_harness_revision']
         self.assertTrue({'tests/web-e2e/creator-earnings/financial.isolated.spec.ts','tests/web-e2e/creator-earnings/coverage.isolated.spec.ts'} <= namespace['HARNESS_ONLY_PATHS'])
         self.assertNotIn('tests/web-e2e/creator-earnings/arbitrary.isolated.spec.ts',namespace['HARNESS_ONLY_PATHS'])
+        self.assertIn('tests/web-e2e/creator-earnings/snapshot.isolated.spec.ts',namespace['HARNESS_ONLY_PATHS'])
         self.assertTrue({'scripts/test/earnings_fault_proxy.py','scripts/test/test_earnings_fault_proxy.py'} <= namespace['HARNESS_ONLY_PATHS'])
         self.assertNotIn('scripts/test/arbitrary_proxy.py',namespace['HARNESS_ONLY_PATHS'])
         with tempfile.TemporaryDirectory() as d:

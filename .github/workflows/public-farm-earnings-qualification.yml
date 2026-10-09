@@ -68,6 +68,7 @@ jobs:
            "tests/web-e2e/creator-earnings/money.isolated.spec.ts",
            "tests/web-e2e/creator-earnings/financial.isolated.spec.ts",
            "tests/web-e2e/creator-earnings/coverage.isolated.spec.ts",
+           "tests/web-e2e/creator-earnings/snapshot.isolated.spec.ts",
            "tests/web-e2e/creator-earnings/creator-earnings.spec.ts",
            "tests/web-e2e/creator-earnings/isolated-fixture.ts",
            "scripts/ops/EARNINGS_ENROLLMENT_PROFILE.md",
