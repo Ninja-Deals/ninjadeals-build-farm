@@ -39,6 +39,7 @@ jobs:
   resolve:
     runs-on: ubuntu-latest
     outputs:
+      qa: ${{ steps.inputs.outputs.qa }}
       ref: ${{ steps.inputs.outputs.ref }}
       sha: ${{ steps.inputs.outputs.sha }}
       profile: ${{ steps.inputs.outputs.profile }}
@@ -60,6 +61,7 @@ jobs:
       - name: Resolve build inputs
         id: inputs
         env:
+          QA_PAYLOAD: ${{ toJson(github.event.client_payload.qa) }}
           REF_INPUT: ${{ inputs.ref }}
           REF_PAYLOAD: ${{ github.event.client_payload.ref }}
           SHA_PAYLOAD: ${{ github.event.client_payload.sha }}
@@ -83,6 +85,8 @@ jobs:
           python3 <<'PY'
           import json
           import os
+          import re
+          import base64
 
           def first(*values, default=""):
               for value in values:
@@ -146,13 +150,33 @@ jobs:
                   max_artifact_bytes = max_artifact_bytes or "31457280"
                   require_signed = require_signed or "true"
 
+          qa = json.loads(os.getenv("QA_PAYLOAD", "null"))
+          if qa is not None:
+              if not isinstance(qa, dict) or set(qa) != {"enabled", "run_id", "origin", "ca_pem_base64"} or qa["enabled"] is not True:
+                  raise SystemExit("Invalid QA input shape")
+              if app_kind != "native_android" or profile != "internal" or app_root != "android" or issue:
+                  raise SystemExit("QA requires native internal Android")
+              if not re.fullmatch(r"[0-9a-f]{40}", sha) or ref != sha:
+                  raise SystemExit("QA requires exact immutable ref and SHA")
+              if not isinstance(qa["run_id"], str) or not re.fullmatch(r"qa-[a-z0-9-]{8,76}", qa["run_id"]):
+                  raise SystemExit("Invalid QA run")
+              if qa["origin"] != "https://localhost:18443/" or not isinstance(qa["ca_pem_base64"], str) or len(qa["ca_pem_base64"]) > 21848:
+                  raise SystemExit("Invalid QA public origin/certificate")
+              raw = base64.b64decode(qa["ca_pem_base64"], validate=True)
+              if not 0 < len(raw) <= 16384 or not re.fullmatch(rb"\s*-----BEGIN CERTIFICATE-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----\s*", raw):
+                  raise SystemExit("QA accepts one public CA only")
+              if gradle_task != ":app:assembleInternalDebug" or artifact_glob != "app/build/outputs/apk/internal/debug/app-internal-debug.apk" or artifact_ext != "apk":
+                  raise SystemExit("QA forbids caller-selected tasks/artifacts")
+              if first(os.getenv("BFF_BASE_URL_PAYLOAD")):
+                  raise SystemExit("QA origin is specified only by the QA contract")
+
           bff_base_url = first(os.getenv("BFF_BASE_URL_PAYLOAD"), default="")
           if bff_base_url:
               if app_kind != "native_android" or profile != "internal":
                   raise SystemExit("bff_base_url is restricted to native internal qualification")
               if bff_base_url not in {"https://ninja.deals/", "https://staging.ninja.deals/", "https://test.ninja.deals/"}:
                   raise SystemExit("bff_base_url must be an owned HTTPS origin")
-          bff_base_url = bff_base_url or "https://staging.ninja.deals/"
+          bff_base_url = qa["origin"] if qa else bff_base_url or "https://staging.ninja.deals/"
 
           # Native is the maintained mobile root. Legacy handling above remains unchanged.
           if app_kind != "native_android":
@@ -203,12 +227,16 @@ jobs:
           if invalid:
               raise SystemExit(f"Invalid platform(s): {', '.join(invalid)}")
 
+          if qa and requested_platforms != ["android"]:
+              raise SystemExit("QA requires Android only")
+
           ios_paused = os.getenv("IOS_BUILDS_PAUSED", "").lower() == "true" and "ios" in requested_platforms
           platforms = [p for p in requested_platforms if not (p == "ios" and ios_paused)]
           # A skipped build job still needs a syntactically valid matrix value.
           matrix = {"platform": platforms or ["android"]}
           out = os.environ["GITHUB_OUTPUT"]
           with open(out, "a", encoding="utf-8") as fh:
+              fh.write(f"qa={str(qa is not None).lower()}\n")
               fh.write(f"ref={ref}\n")
               fh.write(f"sha={sha}\n")
               fh.write(f"profile={profile}\n")
@@ -241,6 +269,9 @@ jobs:
     permissions:
       contents: read
     env:
+      ISOLATED_QA: ${{ needs.resolve.outputs.qa }}
+      QA_PAYLOAD: ${{ toJson(github.event.client_payload.qa) }}
+      QA_SOURCE: ${{ needs.resolve.outputs.sha }}
       PLATFORM: ${{ matrix.platform }}
       PROFILE: ${{ needs.resolve.outputs.profile }}
       APP_KIND: ${{ needs.resolve.outputs.app_kind }}
@@ -326,7 +357,33 @@ jobs:
 
       - name: Resolve checkout SHA
         id: source
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [[ "$ISOLATED_QA" == true ]]; then
+            [[ "$actual" == "$QA_SOURCE" ]] || { echo 'QA source mismatch' >&2; exit 1; }
+          fi
+          echo "sha=$actual" >> "$GITHUB_OUTPUT"
+
+      - name: Validate isolated QA public inputs
+        if: needs.resolve.outputs.qa == 'true'
+        run: |
+          set -euo pipefail
+          python3 -m pip install cryptography==50.0.2
+          python3 - <<'PY'
+          import base64,json,os,pathlib
+          qa=json.loads(os.environ['QA_PAYLOAD'])
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'isolated-qa-public'
+          root.mkdir(mode=0o700)
+          ca=root/'ca.pem'
+          ca.write_bytes(base64.b64decode(qa['ca_pem_base64'],validate=True))
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+              f.write('NINJA_ISOLATED_EARNINGS_QA=true\n')
+              f.write('NINJA_QA_RUN_ID='+qa['run_id']+'\n')
+              f.write('NINJA_QA_CA_FILE='+str(ca)+'\n')
+          PY
+          python3 scripts/mobile-native/qa_build.py prepare --source "$QA_SOURCE" --run-id "$(python3 -c 'import json,os;print(json.loads(os.environ["QA_PAYLOAD"])["run_id"])')" --ca "$RUNNER_TEMP/isolated-qa-public/ca.pem" > "$RUNNER_TEMP/isolated-qa-public/input.json"
+
 
       - name: Configure native Android release signing
         if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android' && (needs.resolve.outputs.profile == 'staging' || needs.resolve.outputs.profile == 'production')
@@ -368,7 +425,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Materialise native Android Firebase configuration
-        if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android'
+        if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android' && needs.resolve.outputs.qa != 'true'
         working-directory: ${{ needs.resolve.outputs.app_root }}
         run: |
           set -euo pipefail
@@ -594,7 +651,11 @@ jobs:
             exit 1
           fi
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
-          ./gradlew --no-daemon --no-configuration-cache --console=plain --stacktrace --build-cache --parallel "$GRADLE_TASK"
+          tasks=("$GRADLE_TASK")
+          if [[ "$ISOLATED_QA" == true ]]; then
+            tasks=(:qualifyCreatorEarnings :tests-e2e:assembleDebug)
+          fi
+          ./gradlew --no-daemon --no-configuration-cache --console=plain --stacktrace --build-cache --parallel "${tasks[@]}"
           cp "$ARTIFACT_GLOB" "${{ steps.artifact.outputs.output }}"
           if unzip -l "${{ steps.artifact.outputs.output }}" | grep -q 'lib/'; then
             if ! unzip -l "${{ steps.artifact.outputs.output }}" | grep -q 'lib/arm64-v8a/'; then
@@ -602,6 +663,29 @@ jobs:
               exit 1
             fi
           fi
+
+      - name: Verify isolated QA artifacts
+        if: needs.resolve.outputs.qa == 'true'
+        run: |
+          set -euo pipefail
+          cp android/tests-e2e/build/outputs/apk/debug/tests-e2e-debug.apk "$RUNNER_TEMP/isolated-qa-public/instrumentation.apk"
+          cp "${{ steps.artifact.outputs.output }}" "$RUNNER_TEMP/isolated-qa-public/app.apk"
+          signer="$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -type f -name apksigner | sort -V | tail -1)"
+          analyzer="$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer"
+          python3 scripts/mobile-native/qa_build.py verify --source "$QA_SOURCE" --run-id "$NINJA_QA_RUN_ID" --ca "$NINJA_QA_CA_FILE" --app "$RUNNER_TEMP/isolated-qa-public/app.apk" --test "$RUNNER_TEMP/isolated-qa-public/instrumentation.apk" --analyzer "$analyzer" --signer "$signer" --registry android/config/google-oauth-registrations.json > "$RUNNER_TEMP/isolated-qa-public/verified.json"
+
+      - name: Upload verified isolated QA artifacts
+        if: success() && needs.resolve.outputs.qa == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ninjadeals-android-isolated-qa-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/isolated-qa-public/app.apk
+            ${{ runner.temp }}/isolated-qa-public/instrumentation.apk
+            ${{ runner.temp }}/isolated-qa-public/ca.pem
+            ${{ runner.temp }}/isolated-qa-public/verified.json
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Enforce native Android production artifact policy
         if: needs.resolve.outputs.app_kind == 'native_android' && matrix.platform == 'android' && needs.resolve.outputs.profile == 'production'
@@ -705,7 +789,7 @@ jobs:
           PY
 
       - name: Upload mobile artifact
-        if: always()
+        if: always() && needs.resolve.outputs.qa != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: ninjadeals-${{ matrix.platform }}-${{ needs.resolve.outputs.profile }}-${{ github.run_number }}
@@ -743,6 +827,19 @@ jobs:
               echo "Install: download the IPA artifact from this run and install it on a device included in the EAS/Apple provisioning profile."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove isolated QA public inputs
+        if: always() && needs.resolve.outputs.qa == 'true'
+        run: |
+          python3 - <<'PY'
+          import os,pathlib,shutil
+          root=pathlib.Path(os.environ['RUNNER_TEMP']).resolve()
+          target=root/'isolated-qa-public'
+          if target.exists():
+              if target.is_symlink() or target.resolve().parent != root:
+                  raise SystemExit('Unexpected QA public directory')
+              shutil.rmtree(target)
+          PY
 
   notify:
     needs: [resolve, build]
