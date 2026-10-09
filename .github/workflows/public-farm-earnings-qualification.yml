@@ -59,6 +59,8 @@ jobs:
           HARNESS_ONLY_PATHS = frozenset({
            "scripts/test/earnings_ci.py", "scripts/test/test_earnings_ci.py", "scripts/test/earnings_revision.py",
            "scripts/test/dispatch_earnings_ci.py",
+           "scripts/test/earnings_durability.py", "scripts/test/test_earnings_durability.py",
+           "tests/web-e2e/creator-earnings/durability.isolated.spec.ts",
            "tests/web-e2e/playwright.creator-earnings-ci.config.ts",
            "tests/web-e2e/creator-earnings/safe-reporter.ts", "tests/web-e2e/creator-earnings/safe-reporter.unit.mjs",
            "tests/web-e2e/creator-earnings/money.isolated.spec.ts",
