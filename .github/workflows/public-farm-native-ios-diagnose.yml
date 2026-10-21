@@ -90,7 +90,8 @@ jobs:
         env:
           LANE: ${{ matrix.lane }}
         run: |
-          set -uo pipefail
+          # The default step shell is `bash -e`; keep going after a failed stage.
+          set +e -uo pipefail
           out="$RUNNER_TEMP/diag"
           mkdir -p "$out"
           stage() {
