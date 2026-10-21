@@ -43,7 +43,9 @@ env:
 jobs:
   build:
     runs-on: macos-26
-    timeout-minutes: 60
+    # Static gate (serial package suite) ~13 min, archive ~14 min and the Smoke
+    # build + test 14-33 min no longer fit the former 60-minute budget.
+    timeout-minutes: 120
     concurrency:
       group: native-ios-${{ github.event.client_payload.ref || inputs.ref || 'main' }}-${{ github.event.client_payload.profile || inputs.profile || 'simulator' }}
       cancel-in-progress: false
