@@ -75,7 +75,12 @@ jobs:
             brew install openssl@3 >/dev/null
             openssl_bin="$(brew --prefix openssl@3)/bin/openssl"
           fi
-          "$openssl_bin" pkey -pubin -in "$RUNNER_TEMP/recipient.pem" -noout
+          bits="$("$openssl_bin" pkey -pubin -in "$RUNNER_TEMP/recipient.pem" -noout -text \
+            | sed -n 's/^Public-Key: (\([0-9]*\) bit)$/\1/p')"
+          if [ -z "$bits" ] || [ "$bits" -lt 3072 ]; then
+            echo "recipient_public_key must be an RSA key of at least 3072 bits" >&2
+            exit 1
+          fi
           echo "OPENSSL_BIN=$openssl_bin" >> "$GITHUB_ENV"
 
       - name: Select pinned Xcode
@@ -87,6 +92,8 @@ jobs:
           defaults write com.apple.dt.Xcode IDEBuildingContinueBuildingAfterErrors -bool YES
 
       - name: Run lane with private output captured
+        # Leave time inside the job timeout to encrypt whatever was captured.
+        timeout-minutes: 85
         env:
           LANE: ${{ matrix.lane }}
         run: |
@@ -173,6 +180,8 @@ jobs:
                   tar -cf - --exclude '*.xcresult' -C "$RUNNER_TEMP/native-ios-smoke" . \
                     | tar -xf - -C "$out/smoke-evidence"
                 fi
+              else
+                echo "smoke skipped=xcode-build-failed" | tee -a "$out/status.txt"
               fi
               ;;
             *)
@@ -191,6 +200,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          umask 077
           sealed="$RUNNER_TEMP/sealed"
           mkdir -p "$sealed" "$RUNNER_TEMP/diag"
           if [ -z "${OPENSSL_BIN:-}" ]; then
@@ -198,7 +208,6 @@ jobs:
             exit 1
           fi
           tar -czf "$RUNNER_TEMP/diag.tgz" -C "$RUNNER_TEMP" diag
-          umask 077
           "$OPENSSL_BIN" rand -hex 32 > "$RUNNER_TEMP/payload.key"
           "$OPENSSL_BIN" enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
             -in "$RUNNER_TEMP/diag.tgz" -out "$sealed/diag.tgz.enc" -pass "file:$RUNNER_TEMP/payload.key"
