@@ -278,6 +278,7 @@ jobs:
           ios/scripts/archive.sh "${args[@]}"
 
       - name: Boot, install and launch simulator artifact
+        id: smoke
         if: steps.inputs.outputs.profile == 'simulator'
         run: |
           set -euo pipefail
@@ -359,6 +360,10 @@ jobs:
           expected = {
               'schema_version': '1',
               'backend': 'production',
+              'backend_url': 'https://ninja.deals',
+              'app_bundle_identifier': 'com.ninjadeals.app',
+              'plans': 'Smoke',
+              'selected_methods': 'LaunchJourneyTests/test_US_IOS_001__supported_ios_launch_reaches_an_owned_native_experience',
               'git_head': os.environ['EXPECTED_SHA'],
               'git_clean': 'true',
               'ios_evidence_revision': ios_metadata.current_evidence_revision(str(repo)),
@@ -444,18 +449,32 @@ jobs:
             --issuer-id "$ASC_ISSUER_ID" \
             --private-keys-dir "$keys"
 
-      # This repository is public. The .xcresult and xcodebuild logs (raw under
-      # private/ and redacted under publish/) can quote private source, so only
-      # attributable metadata is published; diagnose a failure with the
-      # encrypted public-farm-native-ios-diagnose.yml workflow.
+      # This repository is public. The .xcresult, the xcodebuild logs (raw under
+      # private/, redacted under publish/) and failure text can quote private
+      # source, so only attributable metadata is published, plus the JUnit of a
+      # passing Smoke (test names only). Diagnose a failure with the encrypted
+      # public-farm-native-ios-diagnose.yml workflow.
+      - name: Stage public Smoke evidence
+        if: always() && steps.inputs.outputs.profile == 'simulator'
+        env:
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+        run: |
+          set -euo pipefail
+          lane="$RUNNER_TEMP/native-ios-smoke/ios-e2e"
+          public="$RUNNER_TEMP/native-ios-smoke-public"
+          mkdir -p "$public/publish"
+          [ -f "$lane/metadata.env" ] && cp "$lane/metadata.env" "$public/"
+          [ -f "$lane/publish/device-metadata.json" ] && cp "$lane/publish/device-metadata.json" "$public/publish/"
+          if [ "$SMOKE_OUTCOME" = success ] && [ -d "$lane/junit" ]; then
+            cp -R "$lane/junit" "$public/"
+          fi
+
       - name: Upload native iOS Smoke runtime evidence
         if: always() && steps.inputs.outputs.profile == 'simulator'
         uses: actions/upload-artifact@v7
         with:
           name: ninjadeals-native-ios-smoke-${{ github.run_number }}
-          path: |
-            ${{ runner.temp }}/native-ios-smoke/ios-e2e/metadata.env
-            ${{ runner.temp }}/native-ios-smoke/ios-e2e/publish/device-metadata.json
+          path: ${{ runner.temp }}/native-ios-smoke-public
           if-no-files-found: error
           retention-days: 30
 

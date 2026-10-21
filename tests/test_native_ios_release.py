@@ -142,17 +142,39 @@ class NativeIOSReleaseWorkflowTest(unittest.TestCase):
         for step in (build, smoke):
             self.assertNotIn('secrets.', str(step.get('env', {})))
         expected = self.step('Verify attributable Smoke runtime metadata')['run']
-        self.assertIn("'backend': 'production'", expected)
+        for pinned in ("'backend': 'production'", "'backend_url': 'https://ninja.deals'",
+                       "'app_bundle_identifier': 'com.ninjadeals.app'", "'plans': 'Smoke'",
+                       "'selected_methods': 'LaunchJourneyTests/"
+                       "test_US_IOS_001__supported_ios_launch_reaches_an_owned_native_experience'"):
+            self.assertIn(pinned, expected)
         build_metadata = self.step('Verify attributable build metadata')['run']
         self.assertIn("'production' if os.environ['PROFILE'] == 'simulator'", build_metadata)
 
-    def test_public_smoke_evidence_is_redacted_metadata_only(self):
-        # The xcresult and xcodebuild logs (raw or redacted) can quote private
-        # source; the public farm keeps only attributable metadata.
+    @unittest.skipUnless(BASH, 'bash is required to stage the public Smoke evidence')
+    def test_public_smoke_evidence_is_metadata_plus_only_a_passing_junit(self):
+        # The xcresult and xcodebuild logs (raw or redacted) and failure text can
+        # quote private source; a passing JUnit lists only test names.
+        stage = self.step('Stage public Smoke evidence')
+        self.assertTrue(stage['if'].startswith('always()'))
+        self.assertEqual("${{ steps.smoke.outcome }}", stage['env']['SMOKE_OUTCOME'])
+        self.assertEqual('smoke', self.step('Boot, install and launch simulator artifact')['id'])
         upload = self.step('Upload native iOS Smoke runtime evidence')['with']
-        self.assertEqual(['${{ runner.temp }}/native-ios-smoke/ios-e2e/metadata.env',
-                          '${{ runner.temp }}/native-ios-smoke/ios-e2e/publish/device-metadata.json'],
-                         upload['path'].strip().splitlines())
+        self.assertEqual('${{ runner.temp }}/native-ios-smoke-public', upload['path'].strip())
+        for outcome, junit in (('success', True), ('failure', False)):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temp:
+                lane = Path(temp) / 'native-ios-smoke/ios-e2e'
+                for relative in ('metadata.env', 'retention.json', 'junit/smoke.xml',
+                                 'publish/device-metadata.json', 'publish/Smoke.xcodebuild.log',
+                                 'private/Smoke.xcodebuild.log', 'private/Smoke.xcresult/Info.plist'):
+                    (lane / relative).parent.mkdir(parents=True, exist_ok=True)
+                    (lane / relative).write_text('x', encoding='utf-8')
+                done = subprocess.run([BASH, '-c', stage['run']], capture_output=True, text=True,
+                                      env={**os.environ, 'RUNNER_TEMP': temp, 'SMOKE_OUTCOME': outcome})
+                self.assertEqual(0, done.returncode, done.stderr)
+                public = Path(temp) / 'native-ios-smoke-public'
+                published = sorted(path.relative_to(public).as_posix() for path in public.rglob('*') if path.is_file())
+                expected = ['metadata.env', 'publish/device-metadata.json'] + (['junit/smoke.xml'] if junit else [])
+                self.assertEqual(sorted(expected), published)
 
 
 class NativeIOSDiagnoseWorkflowTest(unittest.TestCase):
