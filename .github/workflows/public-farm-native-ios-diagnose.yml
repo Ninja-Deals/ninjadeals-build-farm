@@ -1,0 +1,217 @@
+name: Public Farm Native iOS Diagnose
+run-name: Native iOS diagnose ${{ inputs.lanes }} from ${{ inputs.ref }}
+
+# Developer diagnostics for the private native iOS source. Unlike the release
+# workflow, every stage keeps running after a failure so one pass reports the
+# format, package and Xcode results together. This repository is public: stage
+# output (which can quote private source) is written only to files that are
+# encrypted to the dispatcher's RSA public key before upload. The public log
+# carries stage names, exit codes and durations only. Nothing here signs,
+# deploys or writes to the private repository.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: ninjadeals-main branch or commit to diagnose
+        required: true
+      sha:
+        description: Optional full commit the ref must resolve to
+        required: false
+        default: ''
+      recipient_public_key:
+        description: Base64 PEM RSA public key; private output is uploaded only encrypted to it
+        required: true
+      lanes:
+        description: JSON list of lanes to run (package, xcode)
+        required: false
+        default: '["package","xcode"]'
+
+permissions:
+  contents: read
+
+env:
+  MONOREPO: Ninja-Deals/ninjadeals-main
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  diagnose:
+    name: diagnose (${{ matrix.lane }})
+    runs-on: macos-26
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJSON(inputs.lanes) }}
+    steps:
+      - name: Checkout private monorepo
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.MONOREPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          persist-credentials: false
+
+      - name: Verify requested revision
+        env:
+          EXPECTED_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "Diagnosing private revision $actual"
+          if [ -n "$EXPECTED_SHA" ] && [ "$actual" != "$EXPECTED_SHA" ]; then
+            echo "Requested $EXPECTED_SHA but checkout resolved $actual" >&2
+            exit 1
+          fi
+
+      - name: Validate recipient key
+        env:
+          RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$RECIPIENT_PUBLIC_KEY" | base64 --decode > "$RUNNER_TEMP/recipient.pem"
+          openssl_bin="$(brew --prefix openssl@3 2>/dev/null || true)/bin/openssl"
+          if [ ! -x "$openssl_bin" ]; then
+            brew install openssl@3 >/dev/null
+            openssl_bin="$(brew --prefix openssl@3)/bin/openssl"
+          fi
+          "$openssl_bin" pkey -pubin -in "$RUNNER_TEMP/recipient.pem" -noout
+          echo "OPENSSL_BIN=$openssl_bin" >> "$GITHUB_ENV"
+
+      - name: Select pinned Xcode
+        run: |
+          set -euo pipefail
+          sudo xcode-select --switch /Applications/Xcode_26.6.app/Contents/Developer
+          brew list ripgrep >/dev/null 2>&1 || brew install ripgrep >/dev/null
+          ios/scripts/verify-xcode-installation.sh
+          defaults write com.apple.dt.Xcode IDEBuildingContinueBuildingAfterErrors -bool YES
+
+      - name: Run lane with private output captured
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/diag"
+          mkdir -p "$out"
+          stage() {
+            local name="$1"
+            shift
+            local started=$SECONDS
+            "$@" > "$out/$name.log" 2>&1
+            local code=$?
+            printf '%s exit=%s seconds=%s\n' "$name" "$code" "$((SECONDS - started))" | tee -a "$out/status.txt"
+            return "$code"
+          }
+          paths=(ios/Sources ios/App ios/ShareExtension ios/Tests tests/ios-e2e/Sources tests/ios-e2e/Support)
+
+          cat > "$RUNNER_TEMP/smoke.sh" <<'SMOKE'
+          set -euo pipefail
+          app="$RUNNER_TEMP/native-ios/DerivedData/Build/Products/Staging-iphonesimulator/NinjaDeals.app"
+          device_record="$(xcrun simctl list devices available --json | python3 -c '
+          import json
+          import sys
+
+          devices = json.load(sys.stdin).get("devices", {})
+          candidates = [
+              (runtime, device)
+              for runtime, runtime_devices in devices.items()
+              if "iOS" in runtime
+              for device in runtime_devices
+              if device.get("isAvailable") and device.get("name", "").startswith("iPhone")
+          ]
+          if not candidates:
+              raise SystemExit("no available iPhone simulator is installed")
+          runtime, device = candidates[-1]
+          os_version = runtime.rsplit("iOS-", 1)[-1].replace("-", ".")
+          print(device["udid"], device["name"], os_version, sep="\t")
+          ')"
+          IFS=$'\t' read -r device_id device_name device_os <<< "$device_record"
+          xcrun simctl boot "$device_id" 2>/dev/null || true
+          xcrun simctl bootstatus "$device_id" -b
+          xcrun simctl install "$device_id" "$app"
+          xcrun simctl launch --terminate-running-process "$device_id" com.ninjadeals.app.staging
+          export NJD_RUN_ID="diagnose-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          scripts/test/run-ios-e2e.sh \
+            --severity smoke \
+            --destination "platform=iOS Simulator,name=$device_name,OS=$device_os" \
+            --profile current-ios-60hz-iphone \
+            --artifact-dir "$RUNNER_TEMP/native-ios-smoke"
+          xcrun simctl terminate "$device_id" com.ninjadeals.app.staging 2>/dev/null || true
+          xcrun simctl shutdown "$device_id" 2>/dev/null || true
+          SMOKE
+
+          case "$LANE" in
+            package)
+              stage structure ios/scripts/verify-project-structure.sh
+              stage parity python3 scripts/mobile-native/verify-ios-android-screen-parity.py
+              stage forbidden-runtimes ios/scripts/verify-forbidden-runtimes.sh
+              stage secrets ios/scripts/verify-secrets.sh
+              stage dependencies ios/scripts/verify-dependencies.sh
+              stage harness-tests python3 -m unittest \
+                scripts/test/test_ios_l8_harness.py scripts/test/matrix/test_ios_metadata.py
+              stage release-tests python3 -m unittest scripts/release/test_ios_reliability_gate.py
+              stage lint-before ios/scripts/verify-format.sh
+              stage format swift format format \
+                --configuration ios/.swift-format --recursive --in-place "${paths[@]}"
+              git diff --binary > "$out/format.patch"
+              git diff --stat > "$out/format.stat"
+              stage lint-after ios/scripts/verify-format.sh
+              # Package build and tests run on the formatted tree; the format
+              # result is reported separately above.
+              sed 's#^"\$SCRIPT_DIR/verify-format.sh"$#: format reported separately#' \
+                ios/scripts/verify-foundation.sh > ios/scripts/diagnose-foundation.sh
+              chmod +x ios/scripts/diagnose-foundation.sh
+              stage foundation ios/scripts/diagnose-foundation.sh
+              ;;
+            xcode)
+              if stage xcode-build ios/scripts/archive.sh \
+                --profile staging --output-dir "$RUNNER_TEMP/native-ios" --unsigned-simulator; then
+                stage smoke bash "$RUNNER_TEMP/smoke.sh"
+                if [ -d "$RUNNER_TEMP/native-ios-smoke" ]; then
+                  mkdir -p "$out/smoke-evidence"
+                  tar -cf - --exclude '*.xcresult' -C "$RUNNER_TEMP/native-ios-smoke" . \
+                    | tar -xf - -C "$out/smoke-evidence"
+                fi
+              fi
+              ;;
+            *)
+              echo "unknown lane: $LANE" >&2
+              exit 2
+              ;;
+          esac
+          grep -h -E '(error|warning): ' "$out"/*.log | sort -u > "$out/diagnostics.txt" || true
+          echo "diagnostic lines: $(wc -l < "$out/diagnostics.txt" | tr -d ' ')"
+          if grep -qv ' exit=0 ' "$out/status.txt"; then
+            echo "At least one stage failed; see the encrypted diagnostics." >&2
+            exit 1
+          fi
+
+      - name: Encrypt private diagnostics
+        if: always()
+        run: |
+          set -euo pipefail
+          sealed="$RUNNER_TEMP/sealed"
+          mkdir -p "$sealed" "$RUNNER_TEMP/diag"
+          if [ -z "${OPENSSL_BIN:-}" ]; then
+            echo "Recipient key was not validated; refusing to upload private output" >&2
+            exit 1
+          fi
+          tar -czf "$RUNNER_TEMP/diag.tgz" -C "$RUNNER_TEMP" diag
+          umask 077
+          "$OPENSSL_BIN" rand -hex 32 > "$RUNNER_TEMP/payload.key"
+          "$OPENSSL_BIN" enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -in "$RUNNER_TEMP/diag.tgz" -out "$sealed/diag.tgz.enc" -pass "file:$RUNNER_TEMP/payload.key"
+          "$OPENSSL_BIN" pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/recipient.pem" \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in "$RUNNER_TEMP/payload.key" -out "$sealed/payload.key.enc"
+          rm -rf "$RUNNER_TEMP/payload.key" "$RUNNER_TEMP/diag.tgz" "$RUNNER_TEMP/diag"
+          ls -l "$sealed"
+
+      - name: Upload encrypted diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-ios-diagnose-${{ matrix.lane }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/sealed
+          if-no-files-found: error
+          retention-days: 3
