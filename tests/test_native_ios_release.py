@@ -125,6 +125,44 @@ class NativeIOSReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual(['${{ runner.temp }}/native-ios/*.ipa', '${{ runner.temp }}/native-ios/*.zip',
                           '${{ runner.temp }}/native-ios/build-metadata.json'], paths)
 
+    def test_simulator_smoke_is_an_unsigned_read_only_production_build(self):
+        # The staging BFF is retired: Smoke reads production anonymously and
+        # never receives custody, fixtures or the staging app.
+        self.assertNotIn('staging.ninja.deals', self.text)
+        self.assertNotIn('com.ninjadeals.app.staging', self.text)
+        build = self.step('Build unsigned simulator artifact')
+        self.assertIn('--profile production', build['run'])
+        self.assertIn('--unsigned-simulator', build['run'])
+        smoke = self.step('Boot, install and launch simulator artifact')
+        self.assertIn('Production-iphonesimulator/NinjaDeals.app', smoke['run'])
+        self.assertIn('bundle=com.ninjadeals.app\n', smoke['run'])
+        self.assertIn('--backend production', smoke['run'])
+        self.assertIn('--severity smoke', smoke['run'])
+        self.assertNotIn('--coordinate-fixtures', smoke['run'])
+        for step in (build, smoke):
+            self.assertNotIn('secrets.', str(step.get('env', {})))
+        expected = self.step('Verify attributable Smoke runtime metadata')['run']
+        self.assertIn("'backend': 'production'", expected)
+        build_metadata = self.step('Verify attributable build metadata')['run']
+        self.assertIn("'production' if os.environ['PROFILE'] == 'simulator'", build_metadata)
+
+    def test_public_smoke_evidence_is_redacted_metadata_only(self):
+        # The xcresult and xcodebuild logs (raw or redacted) can quote private
+        # source; the public farm keeps only attributable metadata.
+        upload = self.step('Upload native iOS Smoke runtime evidence')['with']
+        self.assertEqual(['${{ runner.temp }}/native-ios-smoke/ios-e2e/metadata.env',
+                          '${{ runner.temp }}/native-ios-smoke/ios-e2e/publish/device-metadata.json'],
+                         upload['path'].strip().splitlines())
+
+
+class NativeIOSDiagnoseWorkflowTest(unittest.TestCase):
+    def test_xcode_lane_smoke_matches_the_production_release_smoke(self):
+        text = Path('.github/workflows/public-farm-native-ios-diagnose.yml').read_text(encoding='utf-8')
+        self.assertNotIn('staging', text.lower())
+        self.assertIn('--profile production --output-dir "$RUNNER_TEMP/native-ios" --unsigned-simulator', text)
+        self.assertIn('Production-iphonesimulator/NinjaDeals.app', text)
+        self.assertIn('--backend production', text)
+
 
 if __name__ == '__main__':
     unittest.main()
