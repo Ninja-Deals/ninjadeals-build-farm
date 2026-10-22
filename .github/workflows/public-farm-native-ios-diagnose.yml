@@ -9,7 +9,8 @@ run-name: Native iOS diagnose ${{ inputs.lanes }} from ${{ inputs.ref }}
 # carries stage names, exit codes and durations only. Nothing here signs,
 # deploys or writes to the private repository. The opt-in screenshots lane
 # captures App Store screenshot candidates from the production app as one
-# signed-out, read-only visitor; its PNGs are sealed like every other output.
+# anonymous visitor (it opens one deal and one thread, recording a view of
+# each); its PNGs are sealed like every other output.
 
 on:
   workflow_dispatch:
@@ -199,7 +200,7 @@ jobs:
               fi
               ;;
             screenshots)
-              # Production app, signed out, read-only; PNGs stay inside the sealed bundle.
+              # Production app, signed out, no user-content writes; PNGs stay inside the sealed bundle.
               stage screenshots env \
                 NJD_SCREENSHOT_OPTIONS="$SCREENSHOT_OPTIONS" \
                 NJD_IOS_GOOGLE_CLIENT_ID="$SHOTS_GOOGLE_CLIENT_ID" \
@@ -212,7 +213,7 @@ jobs:
               exit 2
               ;;
           esac
-          grep -h -E '(error|warning): ' "$out"/*.log | sort -u > "$out/diagnostics.txt" || true
+          grep -rh --include='*.log' -E '(error|warning): ' "$out" | sort -u > "$out/diagnostics.txt" || true
           echo "diagnostic lines: $(wc -l < "$out/diagnostics.txt" | tr -d ' ')"
           if grep -qv ' exit=0 ' "$out/status.txt"; then
             echo "At least one stage failed; see the encrypted diagnostics." >&2
