@@ -95,6 +95,13 @@ class NativeIOSReleaseWorkflowTest(unittest.TestCase):
             self.assertIn(directory, signing['run'])
             self.assertIn(directory, cleanup)
 
+    def test_signing_keychain_is_added_without_dropping_the_user_search_list(self):
+        # Replacing the list hid the login keychain from the package Keychain tests that run
+        # after signing setup (run 39729186753), so a production build failed its static gate.
+        signing = self.step('Configure isolated Apple signing custody')['run']
+        self.assertIn('security list-keychains -d user -s "$keychain" "${existing_keychains[@]}"', signing)
+        self.assertNotIn('security list-keychains -d user -s "$keychain"\n', signing)
+
     def test_checkout_is_the_exact_commit_without_a_persisted_token(self):
         checkout = self.step('Checkout private monorepo')['with']
         self.assertEqual('${{ steps.inputs.outputs.sha || steps.inputs.outputs.ref }}', checkout['ref'])

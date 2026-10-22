@@ -218,7 +218,14 @@ jobs:
           security unlock-keychain -p "$keychain_password" "$keychain"
           security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
-          security list-keychains -d user -s "$keychain"
+          # Prepend, keeping the login keychain: the package Keychain tests run after this step.
+          existing_keychains=()
+          while IFS= read -r entry; do
+            entry="${entry//\"/}"
+            entry="${entry#"${entry%%[![:space:]]*}"}"
+            [ -n "$entry" ] && existing_keychains+=("$entry")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${existing_keychains[@]}"
           rm -f "$certificate"
 
           # Xcode 16+ reads UserData; older tools still read MobileDevice. Install to both.
