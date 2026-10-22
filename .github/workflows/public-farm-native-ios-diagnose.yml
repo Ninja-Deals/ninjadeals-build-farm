@@ -7,7 +7,9 @@ run-name: Native iOS diagnose ${{ inputs.lanes }} from ${{ inputs.ref }}
 # output (which can quote private source) is written only to files that are
 # encrypted to the dispatcher's RSA public key before upload. The public log
 # carries stage names, exit codes and durations only. Nothing here signs,
-# deploys or writes to the private repository.
+# deploys or writes to the private repository. The opt-in screenshots lane
+# captures App Store screenshot candidates from the production app as one
+# signed-out, read-only visitor; its PNGs are sealed like every other output.
 
 on:
   workflow_dispatch:
@@ -23,9 +25,13 @@ on:
         description: Base64 PEM RSA public key; private output is uploaded only encrypted to it
         required: true
       lanes:
-        description: JSON list of lanes to run (package, xcode)
+        description: JSON list of lanes to run (package, xcode, screenshots)
         required: false
         default: '["package","xcode"]'
+      screenshot_options:
+        description: Screenshots lane only, JSON {dealId, threadId, query} of public content to show
+        required: false
+        default: '{}'
 
 permissions:
   contents: read
@@ -96,6 +102,9 @@ jobs:
         timeout-minutes: 85
         env:
           LANE: ${{ matrix.lane }}
+          SCREENSHOT_OPTIONS: ${{ inputs.screenshot_options }}
+          SHOTS_GOOGLE_CLIENT_ID: ${{ matrix.lane == 'screenshots' && secrets.NINJADEALS_PRODUCTION_IOS_GOOGLE_CLIENT_ID || '' }}
+          SHOTS_GOOGLE_SERVER_CLIENT_ID: ${{ matrix.lane == 'screenshots' && secrets.NINJADEALS_PRODUCTION_GOOGLE_SERVER_CLIENT_ID || '' }}
         run: |
           # The default step shell is `bash -e`; keep going after a failed stage.
           set +e -uo pipefail
@@ -111,6 +120,9 @@ jobs:
             return "$code"
           }
           paths=(ios/Sources ios/App ios/ShareExtension ios/Tests tests/ios-e2e/Sources tests/ios-e2e/Support)
+          if [ -d tests/ios-e2e/Screenshots ]; then
+            paths+=(tests/ios-e2e/Screenshots)
+          fi
 
           cat > "$RUNNER_TEMP/smoke.sh" <<'SMOKE'
           set -euo pipefail
@@ -185,6 +197,15 @@ jobs:
               else
                 echo "smoke skipped=xcode-build-failed" | tee -a "$out/status.txt"
               fi
+              ;;
+            screenshots)
+              # Production app, signed out, read-only; PNGs stay inside the sealed bundle.
+              stage screenshots env \
+                NJD_SCREENSHOT_OPTIONS="$SCREENSHOT_OPTIONS" \
+                NJD_IOS_GOOGLE_CLIENT_ID="$SHOTS_GOOGLE_CLIENT_ID" \
+                NJD_IOS_GOOGLE_SERVER_CLIENT_ID="$SHOTS_GOOGLE_SERVER_CLIENT_ID" \
+                python3 scripts/mobile-native/ios-app-store-screenshots.py capture \
+                  --output-dir "$out/screenshots" --work-dir "$RUNNER_TEMP/native-ios-screenshots"
               ;;
             *)
               echo "unknown lane: $LANE" >&2
