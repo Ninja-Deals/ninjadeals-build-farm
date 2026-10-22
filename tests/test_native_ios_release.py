@@ -192,6 +192,16 @@ class NativeIOSDiagnoseWorkflowTest(unittest.TestCase):
         self.assertIn('Production-iphonesimulator/NinjaDeals.app', text)
         self.assertIn('--backend production', text)
 
+    def test_screenshots_lane_keeps_google_ids_and_pngs_private(self):
+        text = Path('.github/workflows/public-farm-native-ios-diagnose.yml').read_text(encoding='utf-8')
+        for secret in ('NINJADEALS_PRODUCTION_IOS_GOOGLE_CLIENT_ID', 'NINJADEALS_PRODUCTION_GOOGLE_SERVER_CLIENT_ID'):
+            self.assertIn(f"${{{{ matrix.lane == 'screenshots' && secrets.{secret} || '' }}}}", text)
+        # Options reach the script only through the environment, never inline in the shell script.
+        self.assertIn('SCREENSHOT_OPTIONS: ${{ inputs.screenshot_options }}', text)
+        self.assertEqual(1, text.count('inputs.screenshot_options'))
+        self.assertIn('--output-dir "$out/screenshots"', text)
+        self.assertIn('tar -czf "$RUNNER_TEMP/diag.tgz" -C "$RUNNER_TEMP" diag', text)
+
 
 if __name__ == '__main__':
     unittest.main()
